@@ -1,7 +1,8 @@
 import type { Logger } from '@n8n/backend-common';
 import { QueryFailedError } from '@n8n/typeorm';
 import type { ErrorEvent } from '@sentry/core';
-import { captureException, withIsolationScope } from '@sentry/node';
+import { captureException, init, withIsolationScope } from '@sentry/node';
+import type { NodeOptions } from '@sentry/node';
 import { AxiosError } from 'axios';
 import { ApplicationError, BaseError, ExpressionError, NodeOperationError } from 'n8n-workflow';
 import type { INode } from 'n8n-workflow';
@@ -41,6 +42,10 @@ const eventLoopBlockIntegrationMock = vi.fn((opts: unknown) => ({
 }));
 vi.mock('@sentry/node-native', () => ({
 	eventLoopBlockIntegration: (opts: unknown) => eventLoopBlockIntegrationMock(opts),
+}));
+
+vi.mock('@sentry/profiling-node', () => ({
+	nodeProfilingIntegration: () => ({ name: 'ProfilingIntegration' }),
 }));
 
 vi.spyOn(process, 'on');
@@ -449,6 +454,75 @@ describe('ErrorReporter', () => {
 				vi.useRealTimers();
 			}
 		});
+	});
+
+	describe('init', () => {
+		const initSentry = async (
+			options: Partial<Parameters<ErrorReporter['init']>[0]> = {},
+		): Promise<NodeOptions> => {
+			await new ErrorReporter(mock(), mock()).init({
+				serverType: 'main',
+				dsn: 'https://fake@sentry.example.com/1',
+				release: '1.0.0',
+				environment: 'test',
+				serverName: 'test-server',
+				withEventLoopBlockDetection: false,
+				tracesSampleRate: 0,
+				profilesSampleRate: 0,
+				...options,
+			});
+			const [sentryOptions] = vi.mocked(init).mock.lastCall ?? [];
+			if (!sentryOptions) throw new Error('Expected Sentry init to be called');
+			return sentryOptions;
+		};
+
+		it("keeps Sentry's event filters", async () => {
+			const { integrations } = await initSentry();
+			if (typeof integrations !== 'function') throw new Error('Expected an integrations callback');
+
+			const names = integrations([{ name: 'EventFilters' }, { name: 'Console' }]).map(
+				(integration) => integration?.name,
+			);
+
+			expect(names).toContain('EventFilters');
+			expect(names).not.toContain('Console');
+		});
+
+		it('sends traces as transactions', async () => {
+			const options = await initSentry({ tracesSampleRate: 0.5 });
+
+			expect(options.traceLifecycle).toBe('static');
+		});
+
+		it('collects no personal data', async () => {
+			const { dataCollection } = await initSentry();
+
+			expect(dataCollection?.userInfo).toBe(false);
+			expect(dataCollection?.httpBodies).toEqual([]);
+			expect(dataCollection?.httpHeaders).toMatchObject({
+				request: { deny: expect.arrayContaining(['forwarded']) },
+			});
+		});
+
+		it('samples profiling once per process', async () => {
+			const options = await initSentry({ tracesSampleRate: 0.5, profilesSampleRate: 0.3 });
+
+			expect(options.profileSessionSampleRate).toBe(0.3);
+			expect(options).not.toHaveProperty('profilesSampleRate');
+		});
+
+		it.each([
+			{ tracesSampleRate: 0, eligibleIntegrations: { Postgres: true }, expected: false },
+			{ tracesSampleRate: 0.5, eligibleIntegrations: { Http: true }, expected: false },
+			{ tracesSampleRate: 0.5, eligibleIntegrations: { Postgres: true }, expected: true },
+		])(
+			'sets runtime channel injection to $expected for traces $tracesSampleRate and $eligibleIntegrations',
+			async ({ expected, ...options }) => {
+				const { enableRuntimeChannelInjection } = await initSentry(options);
+
+				expect(enableRuntimeChannelInjection).toBe(expected);
+			},
+		);
 	});
 
 	describe('error with Sentry initialized', () => {
