@@ -2,83 +2,92 @@ import type { Metadata } from '@grpc/grpc-js';
 import { Logger } from '@n8n/backend-common';
 import { OutboundHttp } from '@n8n/backend-network';
 import { Service } from '@n8n/di';
-import type { DiagLogger, Tracer } from '@opentelemetry/api';
-import { DiagLogLevel, context, diag, propagation, trace } from '@opentelemetry/api';
-import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
-import {
-	CompositePropagator,
-	W3CBaggagePropagator,
-	W3CTraceContextPropagator,
-} from '@opentelemetry/core';
+import { getErrorMessage } from '@n8n/utils/errors/get-error-message';
+import { latestWins } from '@n8n/utils/promise/latest-wins';
+import type { Tracer } from '@opentelemetry/api';
+import { trace } from '@opentelemetry/api';
+import { W3CTraceContextPropagator } from '@opentelemetry/core';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
+import { resourceFromAttributes } from '@opentelemetry/resources';
 import {
-	detectResources,
-	envDetector,
-	hostDetector,
-	processDetector,
-	resourceFromAttributes,
-} from '@opentelemetry/resources';
-import {
-	AlwaysOffSampler,
 	BasicTracerProvider,
 	BatchSpanProcessor,
 	type ReadableSpan,
 	type SpanExporter,
 	type SpanProcessor,
 } from '@opentelemetry/sdk-trace-base';
-import { NodeTracerProvider, TraceIdRatioBasedSampler } from '@opentelemetry/sdk-trace-node';
+import { TraceIdRatioBasedSampler } from '@opentelemetry/sdk-trace-node';
 import { InstanceSettings } from 'n8n-core';
 import { OperationalError } from 'n8n-workflow';
 
 import { ExecutionIdentitySpanProcessor } from './execution-identity';
 import type { OtelConnectionParams } from './otel-settings.service';
 import { OtelSettingsService } from './otel-settings.service';
-import { OtelConfig } from './otel.config';
+import type { OtelConfig } from './otel.config';
 import { ATTR, OTEL_TEST_SPAN_NAME } from './otel.constants';
+import { exportOutsideSentryTracing, mergeResourceAttributes } from './otel-span-exporter';
 
 import { N8N_VERSION } from '@/constants';
+import { OtelSdk } from '@/observability/otel-sdk';
+import {
+	TRACING_OFF,
+	type ShutdownErrors,
+	type TracingPipeline,
+} from '@/observability/swappable-pipeline';
 
 export type OtelTestTraceResult = { success: true } | { success: false; error: string };
+
+type ActiveExport = { settings: OtelConfig; spanProcessors: SpanProcessor[] };
+
+type ExportField = Exclude<keyof OtelConnectionParams, 'startupConnectivityTimeoutMs'>;
+
+const EXPORT_FIELDS: ExportField[] = [
+	'exporterProtocol',
+	'exporterEndpoint',
+	'exporterTracingPath',
+	'exporterHeaders',
+	'exporterServiceName',
+];
+
+const hasSameExportFields = (a: OtelConfig, b: OtelConfig) =>
+	EXPORT_FIELDS.every((field) => a[field] === b[field]);
 
 const stripEmptyResolutionNote = (message: string) =>
 	message.replace(/\s*Resolution note:\s*$/, '');
 
-let noopTracerProvider: BasicTracerProvider | undefined;
-
 @Service()
 export class OtelService {
-	private static isDiagnosticsLoggerConfigured = false;
-	private provider?: NodeTracerProvider;
-	private ownsGlobalApi = false;
-	private hasLoggedForeignGlobalApiOwner = false;
+	private activeExport?: ActiveExport;
+
+	private readonly pendingFlushes = new Set<Promise<void>>();
+
+	private isShutDown = false;
 
 	constructor(
 		private readonly otelSettingsService: OtelSettingsService,
 		private readonly instanceSettings: InstanceSettings,
 		private readonly logger: Logger,
 		private readonly outboundHttp: OutboundHttp,
+		private readonly otelSdk: OtelSdk,
 	) {}
 
 	async init(): Promise<void> {
-		const settings = await this.otelSettingsService.loadSettings();
-		await this.start(settings);
+		await this.applySavedSettings();
 	}
 
-	async restart(): Promise<void> {
-		await this.shutdown();
-		const settings = await this.otelSettingsService.loadSettings();
-		await this.start(settings);
-	}
+	readonly applySavedSettings = latestWins(async () => {
+		if (this.isShutDown) return;
+
+		await this.applySettings(await this.otelSettingsService.loadSettings());
+	});
 
 	getTracer(name: string): Tracer {
-		if (this.provider) return this.provider.getTracer(name);
-		noopTracerProvider ??= new BasicTracerProvider({ sampler: new AlwaysOffSampler() });
-		return noopTracerProvider.getTracer(name);
+		return trace.getTracer(name);
 	}
 
 	/**
 	 * Sends a single `n8n.test_trace` span to the given OTLP endpoint and waits
-	 * for the exporter's result. Unlike the long-running provider (which batches spans
+	 * for the exporter's result. Unlike the export pipeline (which batches spans
 	 * fire-and-forget), this uses a throwaway provider/exporter so the collector's
 	 * response — success, a rejection (HTTP status or gRPC status code), or a
 	 * network error — can be reported back to the caller. Runs independently of
@@ -109,10 +118,8 @@ export class OtelService {
 					};
 					provider = new BasicTracerProvider({
 						resource: resourceFromAttributes({
-							[ATTR.OTEL_SERVICE_NAME]: connection.exporterServiceName,
+							...this.resourceAttributes(connection.exporterServiceName),
 							[ATTR.OTEL_SERVICE_VERSION]: N8N_VERSION,
-							[ATTR.INSTANCE_ID]: this.instanceSettings.instanceId,
-							[ATTR.INSTANCE_ROLE]: this.instanceSettings.instanceType,
 						}),
 						sampler: new TraceIdRatioBasedSampler(1),
 						spanProcessors: [processor],
@@ -131,89 +138,98 @@ export class OtelService {
 		}
 	}
 
-	private async start(settings: OtelConfig): Promise<void> {
-		if (!settings.enabled) return;
+	async shutdown(): Promise<void> {
+		this.isShutDown = true;
+		await this.applySavedSettings();
+		this.activeExport = undefined;
+		this.applyPipeline(TRACING_OFF);
+		await Promise.all(this.pendingFlushes);
+	}
 
-		this.configureDiagnosticsLogger();
-		let provider: NodeTracerProvider;
+	private async applySettings(settings: OtelConfig): Promise<void> {
+		if (!this.otelSdk.isRunning) return;
+
+		const previousExport = this.activeExport;
+		const activeExport = await this.exportFor(settings);
+		this.applyPipeline(this.pipelineFor(activeExport, settings));
+		this.activeExport = activeExport;
+
+		if (activeExport && activeExport !== previousExport) {
+			void this.checkEndpointReachability(activeExport);
+		}
+	}
+
+	private async exportFor(settings: OtelConfig): Promise<ActiveExport | undefined> {
+		if (!settings.enabled) return undefined;
+		if (this.activeExport && hasSameExportFields(this.activeExport.settings, settings)) {
+			return this.activeExport;
+		}
+
+		return await this.buildExport(settings);
+	}
+
+	private pipelineFor(
+		activeExport: ActiveExport | undefined,
+		settings: OtelConfig,
+	): TracingPipeline {
+		if (!activeExport) return TRACING_OFF;
+
+		return {
+			spanProcessors: activeExport.spanProcessors,
+			sampler: new TraceIdRatioBasedSampler(settings.tracesSampleRate),
+			propagator: settings.injectOutbound
+				? new W3CTraceContextPropagator()
+				: TRACING_OFF.propagator,
+		};
+	}
+
+	private applyPipeline(pipeline: TracingPipeline): void {
+		const flush = this.otelSdk
+			.apply(pipeline)
+			.catch((error: unknown) => [error])
+			.then((shutdownErrors) => this.warnOnFailedShutdown(shutdownErrors))
+			.finally(() => this.pendingFlushes.delete(flush));
+
+		this.pendingFlushes.add(flush);
+	}
+
+	private warnOnFailedShutdown(shutdownErrors: ShutdownErrors): void {
+		if (shutdownErrors.length === 0) return;
+
+		const [error] = shutdownErrors;
+		this.logger.warn(
+			'Failed to cleanly shut down the previous OpenTelemetry exporter (its flush may have failed)',
+			{ error: getErrorMessage(error) },
+		);
+	}
+
+	private async buildExport(settings: OtelConfig): Promise<ActiveExport | undefined> {
 		try {
-			provider = await this.startProvider(settings);
+			const exporter = mergeResourceAttributes(
+				await this.createTraceExporter(settings),
+				this.resourceAttributes(settings.exporterServiceName),
+			);
+			return {
+				settings,
+				spanProcessors: [
+					new ExecutionIdentitySpanProcessor(),
+					new BatchSpanProcessor(exportOutsideSentryTracing(exporter)),
+				],
+			};
 		} catch (error) {
 			this.logger.error('Failed to start OpenTelemetry tracing, so tracing stays off', {
-				error: error instanceof Error ? error.message : String(error),
+				error: getErrorMessage(error),
 			});
-			await this.shutdown();
-			return;
-		}
-
-		void this.checkEndpointReachability(settings, provider);
-	}
-
-	async shutdown(): Promise<void> {
-		// Cleared before the flush, so a probe that fails meanwhile sees that its provider is gone.
-		const provider = this.provider;
-		this.provider = undefined;
-		try {
-			await provider?.shutdown();
-		} catch (error) {
-			this.logger.warn(
-				'Failed to cleanly shut down OpenTelemetry tracer provider (exporter flush may have failed)',
-				{ error: error instanceof Error ? error.message : String(error) },
-			);
+			return undefined;
 		}
 	}
 
-	private async startProvider(settings: OtelConfig): Promise<NodeTracerProvider> {
-		const traceExporter = await this.createTraceExporter(settings);
-
-		this.provider = new NodeTracerProvider({
-			resource: this.buildResource(settings.exporterServiceName),
-			sampler: new TraceIdRatioBasedSampler(settings.tracesSampleRate),
-			spanProcessors: [new ExecutionIdentitySpanProcessor(), new BatchSpanProcessor(traceExporter)],
-		});
-		this.registerGlobalApi(this.provider);
-		return this.provider;
-	}
-
-	private buildResource(serviceName: string) {
-		return resourceFromAttributes({
+	private resourceAttributes(serviceName: string) {
+		return {
 			[ATTR.OTEL_SERVICE_NAME]: serviceName,
-			[ATTR.OTEL_SERVICE_VERSION]: N8N_VERSION,
 			[ATTR.INSTANCE_ID]: this.instanceSettings.instanceId,
 			[ATTR.INSTANCE_ROLE]: this.instanceSettings.instanceType,
-		}).merge(detectResources({ detectors: [envDetector, processDetector, hostDetector] }));
-	}
-
-	private registerGlobalApi(provider: NodeTracerProvider): void {
-		if (this.ownsGlobalApi) {
-			trace.disable();
-			this.ownsGlobalApi = trace.setGlobalTracerProvider(provider);
-			return;
-		}
-
-		// Claim the global API before installing context and propagation defaults.
-		// A failed claim leaves another library's global registrations in place.
-		this.ownsGlobalApi = trace.setGlobalTracerProvider(provider);
-		if (!this.ownsGlobalApi) {
-			this.logForeignGlobalApiOwner();
-			return;
-		}
-
-		context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
-		propagation.setGlobalPropagator(
-			new CompositePropagator({
-				propagators: [new W3CTraceContextPropagator(), new W3CBaggagePropagator()],
-			}),
-		);
-	}
-
-	private logForeignGlobalApiOwner(): void {
-		if (this.hasLoggedForeignGlobalApiOwner) return;
-
-		this.hasLoggedForeignGlobalApiOwner = true;
-		this.logger.info(
-			'Another library owns the global OpenTelemetry API, so n8n workflow tracing runs on its own tracer provider',
-		);
+		};
 	}
 
 	private async createTraceExporter(
@@ -277,9 +293,9 @@ export class OtelService {
 		for (const [key, value] of Object.entries(headers)) {
 			try {
 				metadata.set(key.toLowerCase(), value);
-			} catch (error) {
+			} catch {
 				this.logger.warn(
-					`Skipping invalid OTEL exporter header "${key}": ${error instanceof Error ? error.message : String(error)}.`,
+					`Skipping invalid OTEL exporter header "${key}": gRPC metadata does not accept this key or its value.`,
 				);
 			}
 		}
@@ -288,13 +304,13 @@ export class OtelService {
 
 	parseOtlpHeaders(headersToSplit: string): Record<string, string> {
 		const headers: Record<string, string> = {};
-		for (const pair of headersToSplit.split(',')) {
+		for (const [index, pair] of headersToSplit.split(',').entries()) {
 			const trimmedPair = pair.trim();
 			if (!trimmedPair) continue;
 
 			if (!trimmedPair.includes('=')) {
 				this.logger.warn(
-					`Skipping invalid OTEL exporter header "${trimmedPair}": missing "=" separator. Expected format: "key=value".`,
+					`Skipping invalid OTEL exporter header entry ${index + 1}: missing "=" separator. Expected format: "key=value".`,
 				);
 				continue;
 			}
@@ -303,7 +319,7 @@ export class OtelService {
 			const trimmedKey = key.trim();
 			if (!trimmedKey) {
 				this.logger.warn(
-					`Skipping invalid OTEL exporter header "${trimmedPair}": empty key. Expected format: "key=value".`,
+					`Skipping invalid OTEL exporter header entry ${index + 1}: empty key. Expected format: "key=value".`,
 				);
 				continue;
 			}
@@ -313,30 +329,13 @@ export class OtelService {
 		return headers;
 	}
 
-	private configureDiagnosticsLogger() {
-		if (OtelService.isDiagnosticsLoggerConfigured) return;
-
-		const diagnosticsLogger: DiagLogger = {
-			error: (...args: unknown[]) => this.logger.error('OpenTelemetry diagnostics error', { args }),
-			warn: (...args: unknown[]) => this.logger.warn('OpenTelemetry diagnostics warning', { args }),
-			info: (...args: unknown[]) => this.logger.info('OpenTelemetry diagnostics info', { args }),
-			debug: (...args: unknown[]) => this.logger.debug('OpenTelemetry diagnostics debug', { args }),
-			verbose: (...args: unknown[]) =>
-				this.logger.debug('OpenTelemetry diagnostics verbose', { args }),
-		};
-		diag.setLogger(diagnosticsLogger, DiagLogLevel.WARN);
-		OtelService.isDiagnosticsLoggerConfigured = true;
-	}
-
 	private buildOtlpTracesUrl(endpoint: string, path: string): string {
 		const exporterEndpointWithoutTrailingSlash = endpoint.replace(/\/+$/, '');
 		return `${exporterEndpointWithoutTrailingSlash}${path}`;
 	}
 
-	private async checkEndpointReachability(
-		settings: OtelConfig,
-		startedProvider: NodeTracerProvider,
-	): Promise<void> {
+	private async checkEndpointReachability(activeExport: ActiveExport): Promise<void> {
+		const { settings } = activeExport;
 		const url = this.resolveExporterUrl(settings);
 		const timeoutMs = settings.startupConnectivityTimeoutMs;
 
@@ -347,8 +346,7 @@ export class OtelService {
 				await this.probeHttpEndpoint(url, timeoutMs);
 			}
 		} catch (error) {
-			// A restart or shutdown replaced the provider this probe belongs to.
-			if (this.provider !== startedProvider) return;
+			if (this.activeExport !== activeExport) return;
 
 			this.logger.error('Failed to connect to OpenTelemetry OTLP endpoint during startup', {
 				endpoint: url,

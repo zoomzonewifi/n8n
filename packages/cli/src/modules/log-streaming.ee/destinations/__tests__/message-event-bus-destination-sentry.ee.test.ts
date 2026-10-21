@@ -1,5 +1,9 @@
+import { NodeClient } from '@sentry/node';
 import { MessageEventBusDestinationTypeNames } from 'n8n-workflow';
 import type { MessageEventBusDestinationSentryOptions } from 'n8n-workflow';
+import { mock } from 'vitest-mock-extended';
+
+import type { MessageEventBus } from '@/eventbus/message-event-bus/message-event-bus';
 
 import {
 	MessageEventBusDestinationSentry,
@@ -26,6 +30,19 @@ describe('MessageEventBusDestinationSentry', () => {
 			expect(isMessageEventBusDestinationSentryOptions({})).toBe(false);
 			expect(isMessageEventBusDestinationSentryOptions(null)).toBe(false);
 			expect(isMessageEventBusDestinationSentryOptions({ label: 'test' })).toBe(false);
+		});
+	});
+
+	describe('constructor', () => {
+		it('creates the Sentry client without message stack traces or load hooks', () => {
+			new MessageEventBusDestinationSentry(mock<MessageEventBus>(), {
+				__type: MessageEventBusDestinationTypeNames.sentry,
+				dsn: 'https://example.sentry.io/123',
+			});
+
+			expect(NodeClient).toHaveBeenCalledWith(
+				expect.objectContaining({ attachStacktrace: false, enableRuntimeChannelInjection: false }),
+			);
 		});
 	});
 

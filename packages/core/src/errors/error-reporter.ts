@@ -1,9 +1,10 @@
 import { inTest, Logger } from '@n8n/backend-common';
 import { isAxiosError } from '@n8n/backend-network';
+import { isSentryTracingEnabled } from '@n8n/config';
 import { type InstanceType } from '@n8n/constants';
 import { Service } from '@n8n/di';
 import type { ReportingOptions } from '@n8n/errors';
-import type { ErrorEvent, EventHint } from '@sentry/core';
+import type { DataCollection, ErrorEvent, EventHint } from '@sentry/core';
 import {
 	ApplicationError,
 	ExecutionCancelledError,
@@ -53,7 +54,7 @@ type ErrorReporterInitOptions = {
 	/** Sample rate (0.0 to 1.0) for successful production webhook transaction traces. */
 	webhookTracesSampleRate?: number;
 
-	/** Sample rate for Sentry profiling (0.0 to 1.0). 0 means disabled */
+	/** Share of processes that profile (0.0 to 1.0). 0 means disabled. */
 	profilesSampleRate: number;
 
 	/**
@@ -78,6 +79,26 @@ const RELEASE_EXPIRATION_WARNING =
 	'Error tracking disabled because this release is older than 6 weeks.';
 
 const SENTRY_MAX_VALUE_LENGTH = 500;
+
+const CHANNEL_INJECTION_INTEGRATIONS: SentryIntegration[] = ['Express', 'Postgres', 'Redis'];
+
+const PII_KEY_SNIPPETS = ['forwarded', '-ip', 'remote-', 'via', '-user'];
+
+const DATA_COLLECTION_WITHOUT_PII: DataCollection = {
+	userInfo: false,
+	cookies: false,
+	httpHeaders: {
+		request: { deny: PII_KEY_SNIPPETS },
+		response: { deny: PII_KEY_SNIPPETS },
+	},
+	httpBodies: [],
+	urlQueryParams: { deny: PII_KEY_SNIPPETS },
+	genAI: { inputs: false, outputs: false },
+	databaseQueryData: false,
+	queues: false,
+	graphQL: { document: false, variables: false },
+	frameContextLines: 7,
+};
 
 const PNPM_NESTED_FRAME_RE = /.*\/node_modules\/\.pnpm\/[^/]+\/node_modules\//;
 const N8N_CLI_INSTALL_PREFIX = '/usr/local/lib/node_modules/n8n/';
@@ -230,14 +251,14 @@ export class ErrorReporter {
 		// Most of the integrations are listed here:
 		// https://docs.sentry.io/platforms/javascript/guides/node/configuration/integrations/
 		const enabledIntegrations = new Set([
-			'InboundFilters',
+			'EventFilters',
 			'FunctionToString',
 			'LinkedErrors',
 			'OnUnhandledRejection',
 			'ContextLines',
 		]);
 
-		const isTracingEnabled = tracesSampleRate > 0;
+		const isTracingEnabled = isSentryTracingEnabled({ dsn, tracesSampleRate });
 		if (isTracingEnabled) {
 			const tracingIntegrations: SentryIntegration[] = ['Http', 'Postgres', 'Redis', 'Express'];
 			tracingIntegrations
@@ -246,6 +267,10 @@ export class ErrorReporter {
 
 			this.tracing.setTracingImplementation(new SentryTracing(sentry));
 		}
+
+		const shouldInjectChannels = CHANNEL_INJECTION_INTEGRATIONS.some((name) =>
+			enabledIntegrations.has(name),
+		);
 
 		const isProfilingEnabled = profilesSampleRate > 0;
 		if (isProfilingEnabled && !isTracingEnabled) {
@@ -273,8 +298,11 @@ export class ErrorReporter {
 			environment,
 			serverName,
 			maxValueLength: SENTRY_MAX_VALUE_LENGTH,
+			dataCollection: DATA_COLLECTION_WITHOUT_PII,
+			enableRuntimeChannelInjection: shouldInjectChannels,
 			...(isTracingEnabled
 				? {
+						traceLifecycle: 'static',
 						tracesSampler: buildTracesSampler(tracesSampleRate),
 						beforeSendTransaction: buildBeforeSendTransaction(
 							slowSpanThresholdMs,
@@ -284,9 +312,10 @@ export class ErrorReporter {
 						),
 					}
 				: {}),
-			...(isProfilingEnabled ? { profilesSampleRate, profileLifecycle: 'trace' } : {}),
+			...(isProfilingEnabled
+				? { profileSessionSampleRate: profilesSampleRate, profileLifecycle: 'trace' }
+				: {}),
 			beforeSend: this.beforeSend.bind(this),
-			ignoreTransactions: [`GET ${healthEndpoint}`, 'GET /metrics', 'SET search_path TO'],
 			ignoreSpans: [`GET ${healthEndpoint}`, 'GET /metrics', 'SET search_path TO'],
 			integrations: (integrations) => [
 				...integrations.filter(({ name }) => enabledIntegrations.has(name) && name !== 'Http'),

@@ -1,8 +1,6 @@
 import { Telemetry } from '../sdk/telemetry';
 import type { BuiltTelemetry, OpaqueTracer, OpaqueTracerProvider } from '../types/telemetry';
 
-let registeredOtelContext = false;
-
 const LANGSMITH_TRACEABLE = 'langsmith.traceable';
 const LANGSMITH_IS_ROOT = 'langsmith.is_root';
 const LANGSMITH_PARENT_RUN_ID = 'langsmith.span.parent_id';
@@ -271,7 +269,6 @@ async function createLangSmithTracer(
 			spanProcessors?: unknown[];
 		}) => OpaqueTracerProvider & {
 			getTracer(name: string): OpaqueTracer;
-			register(config?: { propagator?: null }): void;
 		};
 	};
 
@@ -326,13 +323,6 @@ async function createLangSmithTracer(
 	const provider = new NodeTracerProvider({
 		spanProcessors: [processor],
 	});
-	if (!registeredOtelContext) {
-		// AI SDK creates nested operation/provider/tool spans through the active
-		// OpenTelemetry context. Without the Node context manager these spans are
-		// exported as separate root traces even when an explicit tracer is passed.
-		provider.register({ propagator: null });
-		registeredOtelContext = true;
-	}
 
 	return { tracer: provider.getTracer('@n8n/agents'), provider };
 }

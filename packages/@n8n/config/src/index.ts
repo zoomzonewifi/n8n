@@ -64,7 +64,7 @@ export { AiConfig } from './configs/ai.config';
 export { DatabaseConfig, SqliteConfig, statementTimeoutSeconds } from './configs/database.config';
 export { InstanceSettingsConfig } from './configs/instance-settings-config';
 export { InstanceSettingsLoaderConfig } from './configs/instance-settings-loader.config';
-export { sampleRateSchema } from './configs/sentry.config';
+export { isSentryTracingEnabled, sampleRateSchema } from './configs/sentry.config';
 export { positiveIntSchema, nonnegativeIntSchema } from './schemas';
 export type { TaskRunnerMode } from './configs/runners.config';
 export { TaskRunnersConfig } from './configs/runners.config';

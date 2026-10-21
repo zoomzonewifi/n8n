@@ -7,6 +7,8 @@ import { mock } from 'vitest-mock-extended';
 import type { OtelConnectionParams, OtelSettingsService } from '../otel-settings.service';
 import { OtelService } from '../otel.service';
 
+import type { OtelSdk } from '@/observability/otel-sdk';
+
 // Only the gRPC exporter is mocked, so grpc-js and the OTLP/HTTP exporter stay real:
 // their option and metadata rules are stricter than any stand-in, and warn-and-skip
 // and creation-time failures must hold against the real classes.
@@ -50,6 +52,7 @@ describe('OtelService with real gRPC dependencies', () => {
 			mock<InstanceSettings>({ instanceId: 'inst-1', instanceType: 'main' }),
 			logger,
 			mock<OutboundHttp>(),
+			mock<OtelSdk>(),
 		);
 	});
 
@@ -67,18 +70,31 @@ describe('OtelService with real gRPC dependencies', () => {
 		});
 
 		it('warns and skips a header key with illegal characters', async () => {
-			const { result, metadata } = await exportWithHeaders('bad key=value,x-tenant=acme');
+			const { result, metadata } = await exportWithHeaders('bad key=secret-value,x-tenant=acme');
 
 			expect(metadata.getMap()).toEqual({ 'x-tenant': 'acme' });
 			expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('bad key'));
+			expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('secret-value'));
 			expect(result).toEqual({ success: true });
 		});
 
 		it('warns and skips a "-bin" header key, which grpc-js allows only for buffers', async () => {
-			const { result, metadata } = await exportWithHeaders('x-token-bin=abc,x-tenant=acme');
+			const { result, metadata } = await exportWithHeaders(
+				'x-token-bin=secret-value,x-tenant=acme',
+			);
 
 			expect(metadata.getMap()).toEqual({ 'x-tenant': 'acme' });
 			expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('x-token-bin'));
+			expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('secret-value'));
+			expect(result).toEqual({ success: true });
+		});
+
+		it('names only the key in the warning for a header value that gRPC does not accept', async () => {
+			const { result, metadata } = await exportWithHeaders('x-token=sécret-value,x-tenant=acme');
+
+			expect(metadata.getMap()).toEqual({ 'x-tenant': 'acme' });
+			expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('x-token'));
+			expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('sécret-value'));
 			expect(result).toEqual({ success: true });
 		});
 	});

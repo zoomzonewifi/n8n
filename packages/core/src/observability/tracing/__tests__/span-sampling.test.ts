@@ -12,7 +12,7 @@ const THRESHOLD_MS = 1000;
 
 /** Builds a minimal child SpanJSON with a duration of `durationMs`. */
 function span(overrides: Partial<SpanJSON> & { op?: string; durationMs?: number }): SpanJSON {
-	const { durationMs = 0, ...rest } = overrides;
+	const { durationMs = 0, status = 'ok', ...rest } = overrides;
 	const startTimestamp = 1000;
 	return {
 		span_id: 'span-id',
@@ -20,6 +20,7 @@ function span(overrides: Partial<SpanJSON> & { op?: string; durationMs?: number 
 		start_timestamp: startTimestamp,
 		timestamp: startTimestamp + durationMs / 1000,
 		data: {},
+		status,
 		...rest,
 	};
 }
@@ -68,12 +69,9 @@ describe('buildBeforeSendTransaction', () => {
 		expect(result?.spans).toEqual([slowDb]);
 	});
 
-	it.each(['middleware.express', 'router.express', 'request_handler.express'])(
-		'drops %s spans wholesale',
-		(op) => {
-			expect(filterSpans([span({ op, durationMs: 5000 })])).toEqual([]);
-		},
-	);
+	it.each(['middleware', 'router', 'handler'])('drops %s spans wholesale', (op) => {
+		expect(filterSpans([span({ op, durationMs: 5000 })])).toEqual([]);
+	});
 
 	it.each(['db', 'http.client'])('drops fast, non-errored %s spans', (op) => {
 		expect(filterSpans([span({ op, durationMs: THRESHOLD_MS - 1, status: 'ok' })])).toEqual([]);
@@ -107,7 +105,7 @@ describe('buildBeforeSendTransaction', () => {
 		const slowDb = span({ op: 'db', durationMs: 2000, status: 'ok' });
 		const httpServer = span({ op: 'http.server', durationMs: 50, status: 'ok' });
 		const result = filterSpans([
-			span({ op: 'middleware.express', durationMs: 40 }),
+			span({ op: 'middleware', durationMs: 40 }),
 			span({ op: 'db', durationMs: 2, status: 'ok' }),
 			slowDb,
 			httpServer,
@@ -128,7 +126,7 @@ describe('buildBeforeSendTransaction', () => {
 			span({
 				span_id: 'express-span',
 				parent_span_id: 'root-span',
-				op: 'middleware.express',
+				op: 'middleware',
 				durationMs: 40,
 			}),
 			slowDb,
@@ -206,7 +204,7 @@ describe('buildTracesSampler', () => {
 	const tracesSampler = buildTracesSampler(BASE_RATE);
 
 	function ctx(
-		attributes?: TracesSamplerSamplingContext['attributes'],
+		attributes: TracesSamplerSamplingContext['attributes'] = {},
 		inheritedRate?: number,
 	): TracesSamplerSamplingContext {
 		return {
@@ -237,7 +235,7 @@ describe('buildTracesSampler', () => {
 		expect(tracesSampler(ctx({ 'sentry.op': 'http.server' }, 1))).toBe(1);
 	});
 
-	it('returns the base rate when attributes are missing', () => {
+	it('returns the base rate when the op attribute is missing', () => {
 		expect(tracesSampler(ctx())).toBe(BASE_RATE);
 	});
 });

@@ -7,10 +7,10 @@ export class SentryConfig {
 	dsn: string = '';
 
 	/**
-	 * Sample rate for Sentry profiling (0.0 to 1.0).
-	 * This determines what percentage of transactions are profiled.
-	 *
-	 * @default 0 (disabled)
+	 * Share of n8n processes that record Sentry profiles, from 0.0 to 1.0. Each
+	 * process decides once at startup and then profiles the traces it sends, so
+	 * also set `N8N_SENTRY_TRACES_SAMPLE_RATE` above 0. Set to 0 to turn off
+	 * profiling.
 	 */
 	@Env('N8N_SENTRY_PROFILES_SAMPLE_RATE', sampleRateSchema)
 	profilesSampleRate: number = 0;
