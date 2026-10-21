@@ -74,8 +74,6 @@ function pickReply(prompt: string): string {
 	return 'Sorry about that. I have started a fix and you will see it in 3 to 5 days.';
 }
 
-test.use({ video: 'on' });
-
 test.describe(
 	'Agent checks: ungraded verdicts',
 	{ annotation: [{ type: 'owner', description: 'Agent' }] },
