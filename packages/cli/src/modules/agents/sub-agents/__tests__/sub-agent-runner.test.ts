@@ -618,12 +618,13 @@ describe('SubAgentRunner', () => {
 	});
 
 	describe('execution links', () => {
-		const runContext = {
+		// Build the context in each test: `credentialProvider` is assigned in `beforeEach`.
+		const runContext = () => ({
 			projectId,
 			parentAgentId,
 			credentialProvider,
 			runType: 'production' as const,
-		};
+		});
 
 		it('links a child to the parent turn that delegates it', async () => {
 			executionRepository.findLinksForChildOf.mockResolvedValue({
@@ -631,7 +632,7 @@ describe('SubAgentRunner', () => {
 				rootExecutionId: 'turn-1',
 			});
 
-			await runner.run({ ...spawnRequest, parentExecutionId: 'turn-1' }, runContext);
+			await runner.run({ ...spawnRequest, parentExecutionId: 'turn-1' }, runContext());
 
 			expect(executionRepository.findLinksForChildOf).toHaveBeenCalledWith('turn-1');
 			expect(agentExecutionService.startExecutionRecording).toHaveBeenCalledWith(
@@ -649,7 +650,7 @@ describe('SubAgentRunner', () => {
 				rootExecutionId: 'turn-1',
 			});
 
-			await runner.run({ ...spawnRequest, parentExecutionId: 'child-1' }, runContext);
+			await runner.run({ ...spawnRequest, parentExecutionId: 'child-1' }, runContext());
 
 			expect(executionRepository.findLinksForChildOf).toHaveBeenCalledWith('child-1');
 			expect(agentExecutionService.startExecutionRecording).toHaveBeenCalledWith(
@@ -661,8 +662,8 @@ describe('SubAgentRunner', () => {
 		});
 
 		it('stores no links when the parent execution is unknown or missing', async () => {
-			await runner.run(spawnRequest, runContext);
-			await runner.run({ ...spawnRequest, parentExecutionId: 'deleted-turn' }, runContext);
+			await runner.run(spawnRequest, runContext());
+			await runner.run({ ...spawnRequest, parentExecutionId: 'deleted-turn' }, runContext());
 
 			expect(executionRepository.findLinksForChildOf).toHaveBeenCalledTimes(1);
 			for (const [params] of agentExecutionService.startExecutionRecording.mock.calls) {
@@ -673,7 +674,10 @@ describe('SubAgentRunner', () => {
 		it('runs the child without links when the link lookup fails', async () => {
 			executionRepository.findLinksForChildOf.mockRejectedValue(new Error('database unavailable'));
 
-			const result = await runner.run({ ...spawnRequest, parentExecutionId: 'turn-1' }, runContext);
+			const result = await runner.run(
+				{ ...spawnRequest, parentExecutionId: 'turn-1' },
+				runContext(),
+			);
 
 			expect(result.status).toBe('completed');
 			expect(agentExecutionService.startExecutionRecording.mock.calls[0][0]).not.toHaveProperty(
@@ -701,7 +705,7 @@ describe('SubAgentRunner', () => {
 					resumeContext: { agentId: 'agent-1' },
 					parentThreadId,
 				},
-				runContext,
+				runContext(),
 			);
 
 			expect(executionRepository.findFirstLinksInThread).toHaveBeenCalledWith('child-thread-1');

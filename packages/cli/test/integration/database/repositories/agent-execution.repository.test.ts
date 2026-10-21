@@ -4615,12 +4615,17 @@ describe('AgentExecutionRepository', () => {
 		});
 
 		it('reuses the links of the first execution in a resumed child thread', async () => {
-			const { childThread, turn } = await createDelegationTree();
-			// A later parent turn resumes the child. The child keeps its original links.
+			const { parentThread, childThread, turn } = await createDelegationTree();
+			// A later execution in the child thread links to a different parent turn,
+			// so a lookup of the latest links would return the wrong turn.
+			const laterTurn = await createExecution({
+				threadId: parentThread.id,
+				createdAt: new Date('2026-10-08T10:30:00Z'),
+			});
 			await createExecution({
 				threadId: childThread.id,
-				parentExecutionId: turn.id,
-				rootExecutionId: turn.id,
+				parentExecutionId: laterTurn.id,
+				rootExecutionId: laterTurn.id,
 				createdAt: new Date('2026-10-08T11:00:00Z'),
 			});
 
