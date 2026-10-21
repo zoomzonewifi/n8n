@@ -2,7 +2,9 @@ import type { Logger } from '@n8n/backend-common';
 import type { EventService } from '@n8n/backend-services';
 import { mockInstance, mockLogger } from '@n8n/backend-test-utils';
 import { GlobalConfig } from '@n8n/config';
-import type { ExecutionRepository } from '@n8n/db';
+import type { ExecutionRepository, User, WorkflowEntity, WorkflowRepository } from '@n8n/db';
+import type { WorkflowExecuteAfterContext } from '@n8n/decorators';
+import { Container } from '@n8n/di';
 import type {
 	IRun,
 	IWorkflowBase,
@@ -15,9 +17,12 @@ import { mock } from 'vitest-mock-extended';
 
 import type { ActiveExecutions } from '@/active-executions';
 import { ConcurrencyControlService } from '@/concurrency/concurrency-control.service';
+import type { ExecutionRecoveryService } from '@/executions/execution-recovery.service';
 import type { IExecutingWorkflowData } from '@/interfaces';
 import type { License } from '@/license';
 import type { Telemetry } from '@/telemetry';
+import type { UserManagementMailer } from '@/user-management/email/user-management-mailer';
+import type { WorkflowPushNotifier } from '@/workflows/workflow-push-notifier.service';
 
 import { HOLD_LIMIT_MS } from '../memory-guard.constants';
 import { MemoryGuardService } from '../memory-guard.service';
@@ -29,6 +34,11 @@ vi.mock('../memory-usage', () => ({
 	getContainerLimit: () => 1_000,
 	readMemoryUsage: vi.fn(),
 }));
+
+const { deactivateWorkflowAsSystem } = vi.hoisted(() => ({
+	deactivateWorkflowAsSystem: vi.fn(),
+}));
+vi.mock('@/workflows/workflow.service.js', () => ({ WorkflowService: class {} }));
 
 const MB = 1024 * 1024;
 
@@ -48,6 +58,10 @@ describe('MemoryGuardService', () => {
 	const logger = mock<Logger>();
 	const guardLogger = mock<Logger>();
 	logger.scoped.mockReturnValue(guardLogger);
+	const workflowRepository = mock<WorkflowRepository>();
+	const executionRecoveryService = mock<ExecutionRecoveryService>();
+	const mailer = mock<UserManagementMailer>();
+	const workflowPushNotifier = mock<WorkflowPushNotifier>();
 
 	let concurrencyControl: ConcurrencyControlService;
 	let stoppedExecutions: StoppedExecutions;
@@ -130,6 +144,7 @@ describe('MemoryGuardService', () => {
 		utilization = 0.5;
 		executions.clear();
 		estimates.clear();
+		deactivateWorkflowAsSystem.mockReset();
 
 		activeExecutions.getActiveExecutions.mockImplementation(() =>
 			[...executions].map(([id, e]) => ({
@@ -162,6 +177,10 @@ describe('MemoryGuardService', () => {
 			concurrencyControl,
 			tracker,
 			stoppedExecutions,
+			workflowRepository,
+			executionRecoveryService,
+			mailer,
+			workflowPushNotifier,
 		);
 		guard.init();
 	});
@@ -621,6 +640,146 @@ describe('MemoryGuardService', () => {
 			await sample();
 
 			expect(stoppedExecutions.isFinishing('ended')).toBe(false);
+		});
+	});
+
+	describe('deactivation', () => {
+		const stopOnce = async (
+			id: string,
+			{ mode = 'webhook', after = 0.5 }: { mode?: WorkflowExecuteMode; after?: number } = {},
+		) => {
+			addExecution(id, { megabytes: 300, mode, workflowId: 'repeat' });
+			readMemoryUsageOnce(0.96);
+			readMemoryUsageOnce(after);
+			await sample();
+			await vi.advanceTimersByTimeAsync(0);
+		};
+
+		beforeEach(async () => {
+			const { WorkflowService } = await import('@/workflows/workflow.service.js');
+			Container.set(
+				WorkflowService,
+				mock<InstanceType<typeof WorkflowService>>({ deactivateWorkflowAsSystem }),
+			);
+			workflowRepository.findOne.mockResolvedValue(
+				mock<WorkflowEntity>({ id: 'repeat', activeVersionId: 'version' }),
+			);
+			executionRecoveryService.getAutodeactivationRecipient.mockResolvedValue(mock<User>());
+		});
+
+		it('should deactivate a workflow after three stops that freed memory, and notify', async () => {
+			await stopOnce('1');
+			await stopOnce('2');
+			expect(deactivateWorkflowAsSystem).not.toHaveBeenCalled();
+
+			await stopOnce('3');
+
+			expect(deactivateWorkflowAsSystem).toHaveBeenCalledWith('repeat');
+			expect(mailer.notifyWorkflowAutodeactivated).toHaveBeenCalledWith(
+				expect.objectContaining({ reason: 'memory-pressure' }),
+			);
+			expect(workflowPushNotifier.notify).toHaveBeenCalledWith('repeat', {
+				type: 'workflowAutoDeactivated',
+				data: { workflowId: 'repeat' },
+			});
+		});
+
+		it.each([
+			[
+				'the deactivation fails',
+				() => deactivateWorkflowAsSystem.mockRejectedValueOnce(new Error()),
+			],
+			[
+				'the workflow lookup fails',
+				() => workflowRepository.findOne.mockRejectedValueOnce(new Error()),
+			],
+		])('should try again at the next stop when %s', async (_, fail) => {
+			fail();
+			await stopOnce('1');
+			await stopOnce('2');
+			await stopOnce('3');
+			expect(stopLogs()).toHaveLength(3);
+			expect(mailer.notifyWorkflowAutodeactivated).not.toHaveBeenCalled();
+
+			await stopOnce('4');
+
+			expect(deactivateWorkflowAsSystem).toHaveBeenCalledWith('repeat');
+			expect(mailer.notifyWorkflowAutodeactivated).toHaveBeenCalled();
+		});
+
+		it('should push the deactivation when the email fails', async () => {
+			mailer.notifyWorkflowAutodeactivated.mockRejectedValueOnce(new Error());
+
+			await stopOnce('1');
+			await stopOnce('2');
+			await stopOnce('3');
+
+			expect(workflowPushNotifier.notify).toHaveBeenCalled();
+		});
+
+		it('should finish the stop without waiting for the email', async () => {
+			mailer.notifyWorkflowAutodeactivated.mockReturnValueOnce(new Promise(() => {}));
+
+			await stopOnce('1');
+			await stopOnce('2');
+			await stopOnce('3');
+			await stopOnce('4');
+
+			expect(stoppedIds()).toEqual(['1', '2', '3', '4']);
+		});
+
+		it('should not count stops of manual executions', async () => {
+			await stopOnce('1', { mode: 'manual' });
+			await stopOnce('2', { mode: 'manual' });
+			await stopOnce('3', { mode: 'manual' });
+
+			expect(deactivateWorkflowAsSystem).not.toHaveBeenCalled();
+		});
+
+		it('should not count stops that freed no memory', async () => {
+			for (const id of ['1', '2', '3']) {
+				utilization = 0.96;
+				await stopOnce(id, { after: 0.96 });
+				await vi.advanceTimersByTimeAsync(3_000);
+				utilization = 0.5;
+				await sample();
+			}
+
+			expect(stoppedIds()).toEqual(['1', '2', '3']);
+			expect(deactivateWorkflowAsSystem).not.toHaveBeenCalled();
+		});
+
+		it('should not count stops after a held execution waits too long', async () => {
+			activeExecutions.stopExecution.mockImplementation((id) => {
+				executions.delete(id);
+				utilization = 0.5;
+			});
+			for (const id of ['1', '2', '3']) {
+				addExecution(id, { megabytes: 300, workflowId: 'repeat' });
+				utilization = 0.82;
+				await sample(2);
+				void concurrencyControl.throttle({ mode: 'webhook', executionId: `held-${id}` });
+				await vi.advanceTimersByTimeAsync(HOLD_LIMIT_MS + 300);
+				await sample(2);
+			}
+
+			expect(stoppedIds()).toEqual(['1', '2', '3']);
+			expect(deactivateWorkflowAsSystem).not.toHaveBeenCalled();
+		});
+
+		it('should start the count again after a successful execution of the workflow', async () => {
+			await stopOnce('1');
+			await stopOnce('2');
+			guard.onExecutionEnd(
+				mock<WorkflowExecuteAfterContext>({
+					workflow: { id: 'repeat' },
+					runData: { status: 'success' },
+				}),
+			);
+
+			await stopOnce('3');
+
+			expect(deactivateWorkflowAsSystem).not.toHaveBeenCalled();
 		});
 	});
 

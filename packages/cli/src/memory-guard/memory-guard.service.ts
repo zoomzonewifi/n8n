@@ -1,6 +1,7 @@
 import { Logger } from '@n8n/backend-common';
-import { OnShutdown } from '@n8n/decorators';
-import { Service } from '@n8n/di';
+import { type WorkflowEntity, WorkflowRepository } from '@n8n/db';
+import { OnLifecycleEvent, OnShutdown, type WorkflowExecuteAfterContext } from '@n8n/decorators';
+import { Container, Service } from '@n8n/di';
 import { ensureError } from '@n8n/utils/errors/ensure-error';
 import { formatBytes } from '@n8n/utils/number/bytes';
 import { sleep } from '@n8n/utils/sleep';
@@ -8,6 +9,10 @@ import { MemoryPressureExecutionCancelledError } from 'n8n-workflow';
 
 import { ActiveExecutions } from '@/active-executions';
 import { ConcurrencyControlService } from '@/concurrency/concurrency-control.service';
+import { ExecutionRecoveryService } from '@/executions/execution-recovery.service';
+import { UserManagementMailer } from '@/user-management/email/user-management-mailer';
+import { isWorkflowIdValid } from '@/utils';
+import { WorkflowPushNotifier } from '@/workflows/workflow-push-notifier.service';
 
 import {
 	ADMIT_INTERVAL_MS,
@@ -18,6 +23,7 @@ import {
 	FREED_SHARE,
 	HOLD_LEVEL,
 	HOLD_LIMIT_MS,
+	PRODUCTION_MODES,
 	RELEASE_TIMEOUT_MS,
 	REMEASURE_INTERVAL_MS,
 	REMEASURE_TIMEOUT_MS,
@@ -26,6 +32,7 @@ import {
 	SLOW_INTERVAL_MS,
 	STARVATION_ADMIT_INTERVAL_MS,
 	STOP_LEVEL,
+	STOPS_TO_DEACTIVATE,
 } from './memory-guard.constants';
 import type { StopTarget, StopTrigger } from './memory-guard.types';
 import { buildStopError, exposeGc, settleWithin } from './memory-guard.utils';
@@ -86,12 +93,18 @@ export class MemoryGuardService {
 	 */
 	private isHoldSuspended = false;
 
+	private readonly stopsByWorkflow = new Map<string, number>();
+
 	constructor(
 		private readonly logger: Logger,
 		private readonly activeExecutions: ActiveExecutions,
 		private readonly concurrencyControl: ConcurrencyControlService,
 		private readonly tracker: RunDataTracker,
 		private readonly stoppedExecutions: StoppedExecutions,
+		private readonly workflowRepository: WorkflowRepository,
+		private readonly executionRecoveryService: ExecutionRecoveryService,
+		private readonly mailer: UserManagementMailer,
+		private readonly workflowPushNotifier: WorkflowPushNotifier,
 	) {
 		this.logger = this.logger.scoped('memory-guard');
 	}
@@ -322,6 +335,8 @@ export class MemoryGuardService {
 	) {
 		await settleWithin(engines, RELEASE_TIMEOUT_MS);
 		const { after, freedMemory } = await this.measureAfterStop(before, target.estimatedBytes);
+		// A hold-limit stop shows that a held execution waited, not that this workflow uses much memory.
+		if (freedMemory && trigger !== 'hold-limit') await this.countStop(target);
 
 		this.logger.warn(
 			`Stopped execution ${target.rootId} of workflow ${target.workflow.id} at ${formatBytes(before.usedBytes)} of ${formatBytes(before.limitBytes)} (${trigger}). It held an estimated ${formatBytes(target.estimatedBytes)} of run data. Memory after the stop: ${formatBytes(after.usedBytes)}`,
@@ -374,9 +389,11 @@ export class MemoryGuardService {
 			}
 			if (estimatedBytes === 0 || (target && estimatedBytes <= target.estimatedBytes)) continue;
 
+			const root = this.activeExecutions.getExecutionOrFail(rootId).executionData;
 			target = {
 				rootId,
-				workflow: this.activeExecutions.getExecutionOrFail(rootId).executionData.workflowData,
+				workflow: root.workflowData,
+				mode: root.executionMode,
 				memberIds: members.sort((a, b) => a.depth - b.depth).map((m) => m.executionId),
 				estimatedBytes,
 			};
@@ -399,5 +416,81 @@ export class MemoryGuardService {
 			depth++;
 		}
 		return { rootId, depth };
+	}
+
+	/** A successful execution shows that the workflow can run, so its count of stops starts again. */
+	@OnLifecycleEvent('workflowExecuteAfter')
+	onExecutionEnd({ workflow, runData }: WorkflowExecuteAfterContext) {
+		if (runData.status === 'success' && workflow.id) this.stopsByWorkflow.delete(workflow.id);
+	}
+
+	/** Count a stop that freed memory. Returns whether the workflow was deactivated. */
+	private async countStop({ workflow, mode }: StopTarget) {
+		// A test run uses the draft, so it says nothing about the published version.
+		if (!PRODUCTION_MODES.includes(mode) || !isWorkflowIdValid(workflow.id)) return false;
+
+		const stops = (this.stopsByWorkflow.get(workflow.id) ?? 0) + 1;
+		this.stopsByWorkflow.set(workflow.id, stops);
+		if (stops < STOPS_TO_DEACTIVATE) return false;
+
+		return await this.deactivate(workflow.id);
+	}
+
+	/** Never throws. After a failure, the count stays, so the next counted stop tries again. */
+	private async deactivate(workflowId: string) {
+		try {
+			const workflow = await this.workflowRepository.findOne({ where: { id: workflowId } });
+			if (!workflow || workflow.activeVersionId === null) {
+				this.stopsByWorkflow.delete(workflowId);
+				return false;
+			}
+
+			// Lazy import, like crash recovery, because the workflow service depends on much
+			const { WorkflowService } = await import('@/workflows/workflow.service.js');
+			await Container.get(WorkflowService).deactivateWorkflowAsSystem(workflowId);
+			this.stopsByWorkflow.delete(workflowId);
+			this.logger.warn(
+				`Deactivated workflow ${workflowId}, because n8n stopped ${STOPS_TO_DEACTIVATE} of its executions to keep the instance from running out of memory`,
+				{ workflowId },
+			);
+			// Not awaited, so that a slow mail server does not delay the next stop.
+			void this.notifyDeactivated(workflow);
+			return true;
+		} catch (error) {
+			this.logger.error(`Failed to deactivate workflow ${workflowId}`, {
+				workflowId,
+				error: ensureError(error),
+			});
+			return false;
+		}
+	}
+
+	private async notifyDeactivated(workflow: WorkflowEntity) {
+		const workflowId = workflow.id;
+		try {
+			await this.workflowPushNotifier.notify(workflowId, {
+				type: 'workflowAutoDeactivated',
+				data: { workflowId },
+			});
+		} catch (error) {
+			this.logger.error(`Failed to push the deactivation of workflow ${workflowId}`, {
+				workflowId,
+				error: ensureError(error),
+			});
+		}
+
+		try {
+			const recipient = await this.executionRecoveryService.getAutodeactivationRecipient(workflow);
+			await this.mailer.notifyWorkflowAutodeactivated({
+				recipient,
+				workflow,
+				reason: 'memory-pressure',
+			});
+		} catch (error) {
+			this.logger.error(`Failed to email about the deactivation of workflow ${workflowId}`, {
+				workflowId,
+				error: ensureError(error),
+			});
+		}
 	}
 }

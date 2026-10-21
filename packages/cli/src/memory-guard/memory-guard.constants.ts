@@ -1,3 +1,5 @@
+import type { WorkflowExecuteMode } from 'n8n-workflow';
+
 /** Utilization at which new production executions start to wait. */
 export const HOLD_LEVEL = 0.8;
 
@@ -54,6 +56,11 @@ export const REMEASURE_INTERVAL_MS = 500;
 
 /** Share of the stopped run data estimate that memory must drop by for a stop to count. */
 export const FREED_SHARE = 0.5;
+
+/** Stops that freed memory before the guard deactivates the workflow. */
+export const STOPS_TO_DEACTIVATE = 3;
+
+export const PRODUCTION_MODES: WorkflowExecuteMode[] = ['webhook', 'trigger', 'chat'];
 
 export const MEMORY_DOCS_URL =
 	'https://docs.n8n.io/deploy/host-n8n/configure-n8n/scaling/fix-memory-issues';
