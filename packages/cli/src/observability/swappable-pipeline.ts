@@ -35,10 +35,10 @@ export class SwappableSpanProcessor implements SpanProcessor {
 	private processors = TRACING_OFF.spanProcessors;
 
 	async replace(next: SpanProcessor[]): Promise<ShutdownErrors> {
-		const previous = this.processors;
+		const leaving = this.processors.filter((processor) => !next.includes(processor));
 		this.processors = next;
 		const results = await Promise.allSettled(
-			previous.map(async (processor) => await processor.shutdown()),
+			leaving.map(async (processor) => await processor.shutdown()),
 		);
 
 		return results.flatMap((result) => (result.status === 'rejected' ? [result.reason] : []));

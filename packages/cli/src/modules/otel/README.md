@@ -42,7 +42,10 @@ and when this module does not load. The task runner has no OTel.
   start its own setup and does not gate that setup's tracers. n8n logs one warning. Workflow
   spans then go to that setup, and the n8n OTel settings have no effect.
 - When the startup step fails, n8n logs the error and starts with tracing off.
-- A save never fails because the old exporter cannot flush. n8n logs one warning.
+- A save does not wait for the old exporter. It flushes in the background, and shutdown waits
+  for it. When the flush fails, n8n logs one warning.
+- A save keeps the exporter when the endpoint, protocol, path, headers and service name stay the
+  same.
 
 The setup starts with three no-op parts: the span processors, the sampler and the propagator.
 `OtelService` builds these parts from the saved settings and gives them to `OtelSdk.apply()`. It

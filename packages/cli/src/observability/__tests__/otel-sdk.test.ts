@@ -226,6 +226,36 @@ describe('OtelSdk', () => {
 			expect(await exportedSpans()).toHaveLength(1);
 		});
 
+		it('sends spans to the new processor as soon as apply is called, before the old one shuts down', async () => {
+			const sdk = createSdk();
+			sdk.start();
+			const flushingProcessor = mock<SpanProcessor>();
+			flushingProcessor.shutdown.mockReturnValue(new Promise(() => {}));
+			await sdk.apply({ ...exportingPipeline(), spanProcessors: [flushingProcessor] });
+
+			void sdk.apply(exportingPipeline());
+			trace.getTracer('n8n-workflow').startSpan('workflow.execute').end();
+
+			expect(await exportedSpans()).toHaveLength(1);
+			expect(flushingProcessor.onEnd).not.toHaveBeenCalled();
+		});
+
+		it('does not shut down a span processor that the next pipeline still uses', async () => {
+			const sdk = createSdk();
+			sdk.start();
+			const keptProcessor = mock<SpanProcessor>();
+			const leavingProcessor = mock<SpanProcessor>();
+			await sdk.apply({
+				...exportingPipeline(),
+				spanProcessors: [keptProcessor, leavingProcessor],
+			});
+
+			await sdk.apply({ ...exportingPipeline(), spanProcessors: [keptProcessor] });
+
+			expect(keptProcessor.shutdown).not.toHaveBeenCalled();
+			expect(leavingProcessor.shutdown).toHaveBeenCalledTimes(1);
+		});
+
 		it('does not replace or gate a tracer provider that another setup registered first', async () => {
 			const foreignExporter = new InMemorySpanExporter();
 			new NodeTracerProvider({

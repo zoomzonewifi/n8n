@@ -5,6 +5,7 @@ import type { OutboundHttp } from '@n8n/backend-network';
 import type { ExpressionEngineConfig } from '@n8n/config';
 import type { AuthenticatedRequest, WorkflowRepository } from '@n8n/db';
 import { context, diag, metrics, propagation, ROOT_CONTEXT, trace } from '@opentelemetry/api';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
 import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import { mock } from 'vitest-mock-extended';
 import type { InstanceSettings } from 'n8n-core';
@@ -25,23 +26,45 @@ import type { TracingSourcesConfig } from '@/observability/tracing-sources.confi
 import type { Publisher } from '@/scaling/pubsub/publisher.service';
 import type { OwnershipService } from '@/services/ownership.service';
 
-const { exportedSpans, urlsWithFailingFlush, exportsInsideSuppressTracing, sentryTracing } =
-	vi.hoisted(() => ({
-		exportedSpans: [] as { url: string; span: ReadableSpan }[],
-		urlsWithFailingFlush: new Set<string>(),
-		exportsInsideSuppressTracing: [] as boolean[],
-		sentryTracing: { isSuppressed: false },
-	}));
+const {
+	exportedSpans,
+	urlsWithFailingFlush,
+	urlsWithHeldExports,
+	heldExports,
+	exportsInsideSuppressTracing,
+	sentryTracing,
+} = vi.hoisted(() => ({
+	exportedSpans: [] as { url: string; span: ReadableSpan }[],
+	urlsWithFailingFlush: new Set<string>(),
+	urlsWithHeldExports: new Set<string>(),
+	heldExports: [] as (() => void)[],
+	exportsInsideSuppressTracing: [] as boolean[],
+	sentryTracing: { isSuppressed: false },
+}));
 
 vi.mock('@opentelemetry/exporter-trace-otlp-proto', () => ({
 	OTLPTraceExporter: vi.fn().mockImplementation(function ({ url }: { url: string }) {
+		const pendingExports: Promise<void>[] = [];
 		return {
 			export: (spans: ReadableSpan[], resultCallback: (result: { code: number }) => void) => {
 				exportsInsideSuppressTracing.push(sentryTracing.isSuppressed);
-				exportedSpans.push(...spans.map((span) => ({ url, span })));
-				resultCallback({ code: 0 });
+				const finish = () => {
+					exportedSpans.push(...spans.map((span) => ({ url, span })));
+					resultCallback({ code: 0 });
+				};
+				if (!urlsWithHeldExports.has(url)) return finish();
+
+				pendingExports.push(
+					new Promise((resolve) =>
+						heldExports.push(() => {
+							finish();
+							resolve();
+						}),
+					),
+				);
 			},
 			shutdown: async () => {
+				await Promise.all(pendingExports);
 				if (urlsWithFailingFlush.has(url)) throw new Error('ECONNREFUSED');
 			},
 			forceFlush: async () => {},
@@ -88,9 +111,16 @@ const enabledSettings: OtelConfig = {
 
 const disabledSettings: OtelConfig = { ...enabledSettings, enabled: false };
 
+const COLLECTOR_A = 'http://collector-a:4318/v1/traces';
+const COLLECTOR_B = 'http://collector-b:4318/v1/traces';
+
 async function exportedAfterFlush() {
 	await new Promise<void>((resolve) => setImmediate(resolve));
 	return exportedSpans;
+}
+
+function releaseHeldExports() {
+	for (const release of heldExports.splice(0)) release();
 }
 
 function startWorkflowSpan() {
@@ -113,6 +143,8 @@ describe('OtelService on the startup OTel setup', () => {
 		exportedSpans.length = 0;
 		exportsInsideSuppressTracing.length = 0;
 		urlsWithFailingFlush.clear();
+		urlsWithHeldExports.clear();
+		heldExports.length = 0;
 		logger = mock<Logger>();
 		fetchMock.mockResolvedValue({ ok: true });
 		otelSettingsService = mock<OtelSettingsService>();
@@ -137,6 +169,7 @@ describe('OtelService on the startup OTel setup', () => {
 	});
 
 	afterEach(async () => {
+		releaseHeldExports();
 		await service.shutdown();
 		trace.disable();
 		context.disable();
@@ -272,6 +305,82 @@ describe('OtelService on the startup OTel setup', () => {
 			'Failed to cleanly shut down the previous OpenTelemetry exporter (its flush may have failed)',
 			{ error: 'ECONNREFUSED' },
 		);
+	});
+
+	it('finishes a save while the old exporter still flushes to a dead endpoint', async () => {
+		await service.init();
+		urlsWithHeldExports.add(COLLECTOR_A);
+		startWorkflowSpan().end();
+		otelSettingsService.loadSettings.mockResolvedValue({
+			...enabledSettings,
+			exporterEndpoint: 'http://collector-b:4318',
+		});
+
+		await service.applySavedSettings();
+		startWorkflowSpan().end();
+
+		expect((await exportedAfterFlush()).map(({ url }) => url)).toEqual([COLLECTOR_B]);
+		expect(heldExports).toHaveLength(1);
+	});
+
+	it('logs one warning when the background flush of the old exporter fails', async () => {
+		await service.init();
+		urlsWithHeldExports.add(COLLECTOR_A);
+		urlsWithFailingFlush.add(COLLECTOR_A);
+		startWorkflowSpan().end();
+		otelSettingsService.loadSettings.mockResolvedValue({
+			...enabledSettings,
+			exporterEndpoint: 'http://collector-b:4318',
+		});
+		await service.applySavedSettings();
+		expect(logger.warn).not.toHaveBeenCalled();
+
+		releaseHeldExports();
+		await exportedAfterFlush();
+
+		expect(logger.warn).toHaveBeenCalledTimes(1);
+		expect(logger.warn).toHaveBeenCalledWith(
+			'Failed to cleanly shut down the previous OpenTelemetry exporter (its flush may have failed)',
+			{ error: 'ECONNREFUSED' },
+		);
+	});
+
+	it('waits for background flushes before shutdown finishes', async () => {
+		await service.init();
+		urlsWithHeldExports.add(COLLECTOR_A);
+		startWorkflowSpan().end();
+		otelSettingsService.loadSettings.mockResolvedValue({
+			...enabledSettings,
+			exporterEndpoint: 'http://collector-b:4318',
+		});
+		await service.applySavedSettings();
+		let isShutDown = false;
+
+		const shutdown = service.shutdown().then(() => (isShutDown = true));
+		await exportedAfterFlush();
+		expect(isShutDown).toBe(false);
+
+		releaseHeldExports();
+		await shutdown;
+		expect(exportedSpans.map(({ url }) => url)).toEqual([COLLECTOR_A]);
+	});
+
+	it('keeps the exporter when a save changes only the sample rate', async () => {
+		await service.init();
+		urlsWithHeldExports.add(COLLECTOR_A);
+		startWorkflowSpan().end();
+		vi.mocked(OTLPTraceExporter).mockClear();
+		otelSettingsService.loadSettings.mockResolvedValue({
+			...enabledSettings,
+			tracesSampleRate: 0.5,
+		});
+
+		await service.applySavedSettings();
+		releaseHeldExports();
+
+		expect((await exportedAfterFlush()).map(({ url }) => url)).toEqual([COLLECTOR_A]);
+		expect(OTLPTraceExporter).not.toHaveBeenCalled();
+		expect(logger.warn).not.toHaveBeenCalled();
 	});
 
 	it('sends nothing and injects no header when OTel is off', async () => {

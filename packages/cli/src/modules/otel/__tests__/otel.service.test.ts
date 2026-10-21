@@ -1,4 +1,5 @@
 import type { Logger } from '@n8n/backend-common';
+import { createDeferredPromise } from '@n8n/utils/promise/deferred-promise';
 import type { OutboundHttp } from '@n8n/backend-network';
 import { trace } from '@opentelemetry/api';
 import { W3CTraceContextPropagator } from '@opentelemetry/core';
@@ -171,6 +172,11 @@ const grpcSettings: OtelConfig = {
 async function flushPromises() {
 	return await new Promise<void>((resolve) => setImmediate(resolve));
 }
+
+const newEndpointSettings: OtelConfig = {
+	...enabledSettings,
+	exporterEndpoint: 'http://new-collector:4318',
+};
 
 describe('OtelService', () => {
 	let otelSettingsService: ReturnType<typeof mock<OtelSettingsService>>;
@@ -496,6 +502,176 @@ describe('OtelService', () => {
 
 			expect(otelSdk.apply).toHaveBeenLastCalledWith(TRACING_OFF);
 		});
+
+		it('applies concurrent saves one at a time, and the last saved settings win', async () => {
+			const firstLoad = createDeferredPromise<OtelConfig>();
+			otelSettingsService.loadSettings
+				.mockReturnValueOnce(firstLoad.promise)
+				.mockResolvedValueOnce(disabledSettings);
+
+			const firstSave = service.applySavedSettings();
+			await flushPromises();
+			const laterSaves = [service.applySavedSettings(), service.applySavedSettings()];
+			expect(otelSettingsService.loadSettings).toHaveBeenCalledTimes(1);
+
+			firstLoad.resolve(enabledSettings);
+			await Promise.all([firstSave, ...laterSaves]);
+
+			expect(otelSettingsService.loadSettings).toHaveBeenCalledTimes(2);
+			expect(otelSdk.apply).toHaveBeenCalledTimes(2);
+			expect(otelSdk.apply).toHaveBeenLastCalledWith(TRACING_OFF);
+		});
+
+		it('starts a new apply for a save that comes while an apply runs', async () => {
+			const firstLoad = createDeferredPromise<OtelConfig>();
+			const secondLoad = createDeferredPromise<OtelConfig>();
+			otelSettingsService.loadSettings
+				.mockReturnValueOnce(firstLoad.promise)
+				.mockReturnValueOnce(secondLoad.promise)
+				.mockResolvedValueOnce(disabledSettings);
+			const firstSave = service.applySavedSettings();
+			await flushPromises();
+			const secondSave = service.applySavedSettings();
+			firstLoad.resolve(enabledSettings);
+			await flushPromises();
+			expect(otelSettingsService.loadSettings).toHaveBeenCalledTimes(2);
+
+			const thirdSave = service.applySavedSettings();
+			secondLoad.resolve(enabledSettings);
+			await Promise.all([firstSave, secondSave, thirdSave]);
+
+			expect(otelSettingsService.loadSettings).toHaveBeenCalledTimes(3);
+			expect(otelSdk.apply).toHaveBeenLastCalledWith(TRACING_OFF);
+		});
+
+		it('runs shutdown after an apply that is still running', async () => {
+			const load = createDeferredPromise<OtelConfig>();
+			otelSettingsService.loadSettings.mockReturnValueOnce(load.promise);
+
+			const save = service.applySavedSettings();
+			await flushPromises();
+			const shutdown = service.shutdown();
+			load.resolve(enabledSettings);
+			await Promise.all([save, shutdown]);
+
+			expect(otelSdk.apply).toHaveBeenCalledTimes(2);
+			expect(otelSdk.apply).toHaveBeenLastCalledWith(TRACING_OFF);
+		});
+
+		it('ignores a save that arrives during shutdown', async () => {
+			otelSettingsService.loadSettings.mockResolvedValue(enabledSettings);
+			await service.init();
+			const oldFlush = createDeferredPromise<unknown[]>();
+			otelSdk.apply.mockReturnValueOnce(oldFlush.promise);
+
+			const shutdown = service.shutdown();
+			await flushPromises();
+			await service.applySavedSettings();
+			oldFlush.resolve([]);
+			await shutdown;
+
+			expect(otelSdk.apply).toHaveBeenCalledTimes(2);
+			expect(otelSdk.apply).toHaveBeenLastCalledWith(TRACING_OFF);
+		});
+
+		it('ignores a save that is queued behind a running apply when shutdown starts', async () => {
+			const load = createDeferredPromise<OtelConfig>();
+			otelSettingsService.loadSettings.mockResolvedValue(enabledSettings);
+			otelSettingsService.loadSettings.mockReturnValueOnce(load.promise);
+			const runningSave = service.applySavedSettings();
+			await flushPromises();
+			const queuedSave = service.applySavedSettings();
+
+			const shutdown = service.shutdown();
+			load.resolve(enabledSettings);
+			await Promise.all([runningSave, queuedSave, shutdown]);
+
+			expect(otelSettingsService.loadSettings).toHaveBeenCalledTimes(1);
+			expect(otelSdk.apply).toHaveBeenCalledTimes(2);
+			expect(otelSdk.apply).toHaveBeenLastCalledWith(TRACING_OFF);
+		});
+
+		it('applies the next save after a save fails', async () => {
+			otelSettingsService.loadSettings
+				.mockRejectedValueOnce(new Error('database is locked'))
+				.mockResolvedValueOnce(enabledSettings);
+
+			await expect(service.applySavedSettings()).rejects.toThrow('database is locked');
+			await service.applySavedSettings();
+
+			expect(otelSdk.apply).toHaveBeenCalledTimes(1);
+			expect(otelSdk.apply).not.toHaveBeenCalledWith(TRACING_OFF);
+		});
+
+		it.each<[string, Partial<OtelConfig>]>([
+			['the sample rate', { tracesSampleRate: 0.5 }],
+			['outbound trace headers', { injectOutbound: false }],
+			['node spans', { includeNodeSpans: false }],
+			['start spans', { emitWorkflowStartSpan: true, emitNodeStartSpan: true }],
+			['production only', { productionExecutionsOnly: false }],
+			['the probe timeout', { startupConnectivityTimeoutMs: 5_000 }],
+		])('keeps the exporter when only %s changes', async (_, change) => {
+			otelSettingsService.loadSettings
+				.mockResolvedValueOnce(enabledSettings)
+				.mockResolvedValueOnce({ ...enabledSettings, ...change });
+			await service.init();
+			const initialProcessors = otelSdk.apply.mock.calls[0][0].spanProcessors;
+
+			await service.applySavedSettings();
+
+			expect(OTLPTraceExporter).toHaveBeenCalledTimes(1);
+			expect(otelSdk.apply.mock.lastCall?.[0].spanProcessors).toBe(initialProcessors);
+		});
+
+		it.each<[string, Partial<OtelConfig>]>([
+			['the endpoint', { exporterEndpoint: 'http://new-collector:4318' }],
+			['the protocol', { exporterProtocol: 'grpc' }],
+			['the traces path', { exporterTracingPath: '/custom/traces' }],
+			['the headers', { exporterHeaders: 'auth=token' }],
+			['the service name', { exporterServiceName: 'n8n-renamed' }],
+		])('builds a new exporter when %s changes', async (_, change) => {
+			otelSettingsService.loadSettings
+				.mockResolvedValueOnce(enabledSettings)
+				.mockResolvedValueOnce({ ...enabledSettings, ...change });
+			await service.init();
+			const initialProcessors = otelSdk.apply.mock.calls[0][0].spanProcessors;
+
+			await service.applySavedSettings();
+
+			expect(otelSdk.apply.mock.lastCall?.[0]).not.toBe(TRACING_OFF);
+			expect(otelSdk.apply.mock.lastCall?.[0].spanProcessors).not.toBe(initialProcessors);
+		});
+
+		it('builds a new exporter when OTel is turned off and on again', async () => {
+			otelSettingsService.loadSettings
+				.mockResolvedValueOnce(enabledSettings)
+				.mockResolvedValueOnce(disabledSettings)
+				.mockResolvedValueOnce(enabledSettings);
+			await service.init();
+
+			await service.applySavedSettings();
+			await service.applySavedSettings();
+
+			expect(OTLPTraceExporter).toHaveBeenCalledTimes(2);
+		});
+
+		it('probes the endpoint only when a save builds a new exporter', async () => {
+			otelSettingsService.loadSettings
+				.mockResolvedValueOnce(enabledSettings)
+				.mockResolvedValueOnce({ ...enabledSettings, tracesSampleRate: 0.5 })
+				.mockResolvedValueOnce(newEndpointSettings);
+			await service.init();
+
+			await service.applySavedSettings();
+			await service.applySavedSettings();
+			await flushPromises();
+
+			expect(fetchMock).toHaveBeenCalledTimes(2);
+			expect(fetchMock).toHaveBeenLastCalledWith(
+				'http://new-collector:4318/v1/traces',
+				expect.anything(),
+			);
+		});
 	});
 
 	describe('exporter build failure', () => {
@@ -521,8 +697,9 @@ describe('OtelService', () => {
 		});
 
 		it('leaves tracing off when a later save cannot build the exporter', async () => {
-			otelSettingsService.loadSettings.mockResolvedValue(enabledSettings);
+			otelSettingsService.loadSettings.mockResolvedValueOnce(enabledSettings);
 			await service.init();
+			otelSettingsService.loadSettings.mockResolvedValueOnce(newEndpointSettings);
 			exporterFailure();
 
 			await expect(service.applySavedSettings()).resolves.not.toThrow();
@@ -600,10 +777,7 @@ describe('OtelService', () => {
 			otelSettingsService.loadSettings.mockResolvedValue(enabledSettings);
 			await service.init();
 
-			otelSettingsService.loadSettings.mockResolvedValue({
-				...enabledSettings,
-				exporterEndpoint: 'http://new-collector:4318',
-			});
+			otelSettingsService.loadSettings.mockResolvedValue(newEndpointSettings);
 			await service.applySavedSettings();
 
 			rejectProbes[0](new Error('ECONNREFUSED on the old endpoint'));
@@ -676,13 +850,17 @@ describe('OtelService', () => {
 		});
 
 		it('should warn and skip entry missing "=" separator', () => {
-			expect(service.parseOtlpHeaders('keyonly')).toEqual({});
+			expect(service.parseOtlpHeaders('k1=v1,pasted-token')).toEqual({ k1: 'v1' });
 			expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('missing "=" separator'));
+			expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('entry 2'));
+			expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('pasted-token'));
 		});
 
 		it('should warn and skip entry with empty key', () => {
-			expect(service.parseOtlpHeaders('=value')).toEqual({});
+			expect(service.parseOtlpHeaders('=secret-value')).toEqual({});
 			expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('empty key'));
+			expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('entry 1'));
+			expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('secret-value'));
 		});
 
 		it('should return empty object for empty string', () => {
