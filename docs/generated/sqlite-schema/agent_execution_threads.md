@@ -112,9 +112,11 @@ erDiagram
   varchar_36_ versionId
 }
 "agent_execution" {
-  BOOLEAN acceptsSteering
+  boolean acceptsSteering
   TEXT attachments
   TEXT author
+  INTEGER cacheReadTokens
+  INTEGER cacheWriteTokens
   INTEGER completionTokens
   REAL cost
   datetime_3_ createdAt
@@ -124,7 +126,9 @@ erDiagram
   varchar_16_ hitlStatus
   varchar_36_ id PK
   varchar_255_ model
+  varchar_36_ parentExecutionId FK
   INTEGER promptTokens
+  varchar_36_ rootExecutionId FK
   varchar_32_ source
   datetime_3_ startedAt
   varchar_16_ status
