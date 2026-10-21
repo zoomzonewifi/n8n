@@ -1316,11 +1316,11 @@ describe('InstanceAiTestAgentPreviewPanel', () => {
 
 		// A judge error means the answer was never graded: it must not read as "passed".
 		describe('when the judge errored', () => {
-			it('never says "passed", and shows a neutral note in place of findings', async () => {
+			it('says neither "passed" nor "needs work", and shows a neutral note in place of findings', async () => {
 				const { getByTestId } = await renderCard({ verdict: UNGRADED_VERDICT });
 
 				expect(getByTestId('instance-ai-test-agent-preview-first-check-title')).toHaveTextContent(
-					'First check needs work',
+					'We couldn\u2019t grade the first check',
 				);
 				expect(getByTestId('instance-ai-test-agent-preview-findings')).toHaveTextContent(
 					'We couldn’t check this answer against its rule.',
