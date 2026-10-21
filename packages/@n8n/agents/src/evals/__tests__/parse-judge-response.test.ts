@@ -73,6 +73,7 @@ describe('parseJudgeResponse', () => {
 		'{"pass": "yes"}',
 		'{"pass": "yes", "score": 0.9}',
 		'{"pass": 0, "score": 0.9}',
+		'Use "pass": true only when the rule is met.',
 		'{"pass": true, "pass": false,',
 		'{"score": [0.9]}',
 		'{"pass": "partially", "reasoning": "Mentions the number but not the date."}',

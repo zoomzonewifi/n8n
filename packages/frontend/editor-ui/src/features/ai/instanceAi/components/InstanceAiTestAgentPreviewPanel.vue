@@ -13,7 +13,7 @@ import { useAgentEvalsStore } from '@/features/agents/agentEvals.store';
 import { useApplyAgentEvalSuggestions } from '@/features/agents/composables/useApplyAgentEvalSuggestions';
 import type { AgentEvalCase } from '@/features/agents/agentEvals.types';
 import {
-	isJudgeError,
+	isUngradedVerdict,
 	readAgentAnswer,
 	readErrorMessage,
 	readVerdictReasoning,
@@ -97,7 +97,7 @@ const firstCheckPassed = computed(
 		(previewVerdict.value?.status === 'completed' && previewVerdict.value.outcome === 'pass'),
 );
 // The judge never graded the answer, so the title must not say the check needs work.
-const firstCheckNotGraded = computed(() => isJudgeError('success', previewVerdict.value));
+const firstCheckNotGraded = computed(() => isUngradedVerdict(previewVerdict.value));
 const firstCheckTitleKey = computed(() => {
 	if (firstCheckPassed.value) return 'instanceAi.testAgentPreview.firstCheckPassed';
 	if (firstCheckNotGraded.value) return 'instanceAi.testAgentPreview.firstCheckNotGraded';

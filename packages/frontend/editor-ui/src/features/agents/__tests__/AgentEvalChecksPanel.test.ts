@@ -373,6 +373,17 @@ describe('AgentEvalChecksPanel', () => {
 		expect(getByTestId('agent-eval-check-judged-1')).toHaveAttribute('data-not-graded', 'false');
 	});
 
+	it('does not count an ungraded check as needs-work', () => {
+		const judgeError = {
+			...result('judge-error-1', 'success'),
+			verdict: { status: 'error' as const, outcome: null, reasoning: 'No clear verdict.' },
+		};
+		const { getByTestId, queryByTestId } = render({ results: [judgeError] });
+
+		expect(queryByTestId('agent-eval-checks-filter-needs-work')).not.toBeInTheDocument();
+		expect(getByTestId('agent-eval-checks-filter-all')).toBeInTheDocument();
+	});
+
 	it('renders a successful case with no verdict (ungraded) as "pass", same as before judging shipped', () => {
 		const ungraded = result('ungraded-1', 'success');
 		const { getByTestId, queryByTestId } = render({ results: [ungraded] });

@@ -130,15 +130,20 @@ export function readVerdictReasoning(verdict: AgentEvalVerdict | null | undefine
 }
 
 /**
- * The case ran, but the judge never graded it: the judge call failed, or its
- * reply had no readable verdict. Shown as "couldn't grade", not as a fail, so
- * the user does not change a working agent because of the judge.
+ * The judge never graded the answer: the judge call failed, or its reply had no
+ * readable verdict. Shown as "couldn't grade", not as a fail, so the user does
+ * not change a working agent because of the judge.
  */
+export function isUngradedVerdict(verdict: AgentEvalVerdict | null | undefined): boolean {
+	return verdict?.status === 'error';
+}
+
+/** The case ran, but the judge never graded it. See `isUngradedVerdict`. */
 export function isJudgeError(
 	status: AgentEvalResultStatus,
 	verdict: AgentEvalVerdict | null | undefined,
 ): boolean {
-	return status === 'success' && verdict?.status === 'error';
+	return status === 'success' && isUngradedVerdict(verdict);
 }
 
 /**

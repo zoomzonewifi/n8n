@@ -2,6 +2,7 @@ import { createServer, type Server } from 'node:http';
 import { nanoid } from 'nanoid';
 
 import { expect, test } from '../../../fixtures/base';
+import { getBackendUrl } from '../../../utils/url-helper';
 
 /**
  * Proof run for the "Couldn't grade" state of agent checks.
@@ -11,13 +12,20 @@ import { expect, test } from '../../../fixtures/base';
  * `judgeReply` holds, so a test can feed the judge an unreadable reply or a
  * readable verdict.
  *
+ * The fake server listens on a free loopback port. The backend must run on this
+ * host to reach it, so the suite skips when `N8N_BASE_URL` is not a loopback URL.
+ *
  * Run it against an instance that has `N8N_AGENT_EVALS_ENABLED=true`:
  *
  *   N8N_TEST_ENV='{"N8N_AGENT_EVALS_ENABLED":"true","N8N_ENABLED_MODULES":"agents,agent-evals,data-table"}' \
  *     pnpm --filter=n8n-playwright test:local:isolated tests/e2e/agents/agent-evals-not-graded.spec.ts
  */
 
-const FAKE_LLM_PORT = 9921;
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1']);
+const backendUrl = getBackendUrl();
+const backendIsLocal = !!backendUrl && LOOPBACK_HOSTS.has(new URL(backendUrl).hostname);
+
+let fakeLlmPort = 0;
 
 const UNREADABLE_JUDGE_REPLY = "I'm sorry, but I can't help with evaluating this content.";
 const FAIL_JUDGE_REPLY = '{"pass": false, "reasoning": "The response breaks the rule."}';
@@ -52,7 +60,12 @@ function messagesText(messages: Array<{ content: unknown }>): string {
 }
 
 function pickReply(prompt: string): string {
-	if (prompt.includes('checking an AI assistant response against a rule')) return judgeReply;
+	if (
+		prompt.includes('checking an AI assistant response against a rule') ||
+		prompt.includes('evaluating an AI assistant response for factual correctness')
+	) {
+		return judgeReply;
+	}
 	if (prompt.includes('You generate realistic test cases')) {
 		const count = Number(/exactly (\d+) test cases/.exec(prompt)?.[1] ?? 1);
 		const cases = Array.from({ length: count }, (_, i) => SAMPLE_CASES[i % SAMPLE_CASES.length]);
@@ -67,6 +80,8 @@ test.describe(
 	'Agent checks: ungraded verdicts',
 	{ annotation: [{ type: 'owner', description: 'Agent' }] },
 	() => {
+		test.skip(!backendIsLocal, 'The fake model server is only reachable from a local backend.');
+
 		test.beforeAll(async () => {
 			fakeLlm = createServer((request, response) => {
 				let raw = '';
@@ -112,7 +127,12 @@ test.describe(
 					);
 				});
 			});
-			await new Promise<void>((resolve) => fakeLlm.listen(FAKE_LLM_PORT, resolve));
+			await new Promise<void>((resolve) => fakeLlm.listen(0, '127.0.0.1', resolve));
+			const address = fakeLlm.address();
+			if (!address || typeof address === 'string') {
+				throw new Error('Fake model server has no TCP address');
+			}
+			fakeLlmPort = address.port;
 		});
 
 		test.afterAll(async () => {
@@ -127,7 +147,7 @@ test.describe(
 			const credential = await api.credentials.createCredential({
 				name: `Fake OpenAI ${nanoid(6)}`,
 				type: 'openAiApi',
-				data: { apiKey: 'sk-fake', url: `http://localhost:${FAKE_LLM_PORT}/v1` },
+				data: { apiKey: 'sk-fake', url: `http://127.0.0.1:${fakeLlmPort}/v1` },
 			});
 			const { id: agentId } = await api.agents.create(project.id, {
 				name: `Support Bot ${nanoid(6)}`,

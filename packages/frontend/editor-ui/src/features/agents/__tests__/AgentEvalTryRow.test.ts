@@ -252,16 +252,26 @@ describe('AgentEvalTryRow', () => {
 			expect(queryByText('Needs work')).not.toBeInTheDocument();
 		});
 
-		it('offers "Run check" instead of the correction controls and fix suggestion', async () => {
+		it('offers "Run check" and "Actually fine", but no correction controls or fix suggestion', async () => {
 			const user = userEvent.setup();
 			const { getByTestId, queryByTestId, getByText } = renderNotGraded();
 			await user.click(getByTestId('row-toggle'));
 
 			expect(getByTestId('row-run-check')).toBeInTheDocument();
+			expect(getByTestId('row-actually-fine')).toBeInTheDocument();
 			expect(queryByTestId('row-suggestion')).not.toBeInTheDocument();
-			expect(queryByTestId('row-actually-fine')).not.toBeInTheDocument();
+			expect(queryByTestId('row-save-check')).not.toBeInTheDocument();
 			expect(queryByTestId('row-suggestion-card')).not.toBeInTheDocument();
 			expect(getByText(/did not give a clear pass or fail/)).toBeInTheDocument();
+		});
+
+		it('emits actually-fine when the user accepts the ungraded answer', async () => {
+			const user = userEvent.setup();
+			const { getByTestId, emitted } = renderNotGraded();
+			await user.click(getByTestId('row-toggle'));
+			await user.click(getByTestId('row-actually-fine'));
+
+			expect(emitted('actually-fine')).toHaveLength(1);
 		});
 	});
 

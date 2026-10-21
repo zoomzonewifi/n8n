@@ -115,9 +115,10 @@ const rows = computed<CheckRow[]>(() =>
 );
 
 const passedCount = computed(() => rows.value.filter((row) => row.status === 'pass').length);
-const needsWorkCount = computed(
-	() => rows.value.filter((row) => row.status === 'work' || row.status === 'fail').length,
-);
+// An ungraded check is not the agent's fault, so it is not counted as needs work.
+const isNeedsWork = (row: CheckRow) =>
+	!row.notGraded && (row.status === 'work' || row.status === 'fail');
+const needsWorkCount = computed(() => rows.value.filter(isNeedsWork).length);
 
 type StatusFilter = 'all' | 'pass' | 'needs-work';
 const statusFilter = ref<StatusFilter>('all');
@@ -192,7 +193,7 @@ const sortedRows = computed(() =>
 const filteredRows = computed(() => {
 	if (statusFilter.value === 'pass') return sortedRows.value.filter((row) => row.status === 'pass');
 	if (statusFilter.value === 'needs-work') {
-		return sortedRows.value.filter((row) => row.status === 'work' || row.status === 'fail');
+		return sortedRows.value.filter(isNeedsWork);
 	}
 	return sortedRows.value;
 });
