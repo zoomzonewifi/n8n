@@ -62,33 +62,4 @@ export class AgentBuilderPage extends BasePage {
 		// Blur to trigger the update event
 		await edit.locator('input, textarea').press('Enter');
 	}
-
-	async openEvalsTab(): Promise<void> {
-		await this.page.locator('[data-testid="agent-header-tabs"]').getByText('Evals').click();
-	}
-
-	/** Saves the checks the Evals tab drafted. The Checks panel opens and a run starts. */
-	async addDraftedChecks(): Promise<void> {
-		await this.page.locator('[data-testid="agent-evals-empty-preview-add-checks"]').click();
-	}
-
-	getChecksPanel(): Locator {
-		return this.page.locator('[data-testid="agent-eval-checks-panel"]');
-	}
-
-	getRunningChecks(): Locator {
-		return this.getChecksPanel().getByText('Running', { exact: true });
-	}
-
-	getNeedsWorkChecks(): Locator {
-		return this.getChecksPanel().getByText('Needs work', { exact: true });
-	}
-
-	getNotGradedChecks(): Locator {
-		return this.getChecksPanel().getByText('Couldn’t grade. Run it again.');
-	}
-
-	getFixSuggestions(): Locator {
-		return this.getChecksPanel().locator('[data-test-id$="-suggestion"]');
-	}
 }
