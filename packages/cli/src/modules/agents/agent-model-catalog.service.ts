@@ -9,6 +9,7 @@ import type { User } from '@n8n/db';
 import { Service } from '@n8n/di';
 
 import { isModelDiscoveryProvider } from '@n8n/ai-utilities/model-discovery';
+import { UserError } from 'n8n-workflow';
 
 import {
 	BuilderModelLiveLookupService,
@@ -19,8 +20,18 @@ import { AgentDefaultModelResolverService } from './agent-default-model-resolver
 import { stripSnapshotSuffix } from './utils/model-snapshot-alias';
 import { normalizeProviderModelId } from './utils/provider-model-id';
 
+/**
+ * Providers whose model list the live lookup can fetch. `azure-openai` is the
+ * exception: it is not a `ListModelsFn` (it needs a project and pre-built auth
+ * headers, see `providers/azure.ts` in `@n8n/ai-utilities`), but
+ * `BuilderModelLiveLookupService` calls `listAzureOpenAiModels` directly for it.
+ */
+function supportsLiveModelLookup(provider: string): boolean {
+	return provider === 'azure-openai' || isModelDiscoveryProvider(provider);
+}
+
 function getProviderCredentialType(provider: string): string | undefined {
-	if (!isModelDiscoveryProvider(provider)) return undefined;
+	if (!supportsLiveModelLookup(provider)) return undefined;
 	return getAgentModelProviderCredentialTypes(provider)[0];
 }
 
@@ -61,7 +72,15 @@ export class AgentModelCatalogService {
 		credentialId?: string,
 	): Promise<AgentProviderModelsResponse> {
 		const credentialType = getProviderCredentialType(provider);
-		if (!credentialId || !credentialType) return await this.unverifiedCatalog(provider);
+		// The managed gateway serves its own model ids, not the user's Foundry
+		// deployments, so managed azure-openai keeps the static catalog.
+		if (
+			!credentialId ||
+			!credentialType ||
+			(provider === 'azure-openai' && credentialId === AI_GATEWAY_MANAGED_TAG)
+		) {
+			return await this.unverifiedCatalog(provider);
+		}
 
 		let lookup: LiveModelLookupResult;
 		try {
@@ -196,7 +215,8 @@ export class AgentModelCatalogService {
 	}
 
 	private logLiveLookupFailure(provider: string, error: unknown): void {
-		this.logger.warn('Live model list failed', {
+		const log = error instanceof UserError ? this.logger.debug : this.logger.warn;
+		log('Live model list failed', {
 			provider,
 			error: error instanceof Error ? error.message : String(error),
 		});
