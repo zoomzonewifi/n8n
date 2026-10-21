@@ -26,6 +26,7 @@ import { systemChatMemoryResourceId } from '../utils/agent-memory-scope';
 import { buildInboundUserMessage } from '../utils/inbound-attachments';
 import { SYSTEM_CHAT_SOURCE } from '../utils/agent-thread-access';
 import { canUseSystemAgent } from './system-agent-access';
+import { SystemAgentHostEventChannel } from './system-agent-host-events';
 import { SystemAgentRegistry } from './system-agent-registry';
 import type {
 	SystemAgentProvider,
@@ -396,6 +397,7 @@ export class SystemAgentExecutionService {
 		signal.throwIfAborted();
 		const { resourceId } = payload;
 		const attachments = payload.attachments ?? [];
+		const hostEvents = this.createHostEventChannel(thread, send);
 		const workspace = await this.acquireWorkspace(provider, thread, user);
 		const controller = new AbortController();
 		// Until the runtime takes the turn, the claim signal (Stop, lost ownership) stops provider setup.
@@ -406,20 +408,27 @@ export class SystemAgentExecutionService {
 		if (signal.aborted) stopSetup();
 		let handle: SystemAgentTurnHandle;
 		try {
-			handle = await this.prepareOrRelease(workspace, controller.signal, thread, async () => {
-				return await provider.prepareTurn({
-					type: 'start',
-					user,
-					thread,
-					resourceId,
-					abortSignal: controller.signal,
-					...(workspace ? { workspace: workspace.lease } : {}),
-					executionId: admission.executionId,
-					message: payload.message,
-					attachments,
-					options: payload.options ?? {},
-				});
-			});
+			handle = await this.prepareOrRelease(
+				workspace,
+				hostEvents,
+				controller.signal,
+				thread,
+				async () => {
+					return await provider.prepareTurn({
+						type: 'start',
+						user,
+						thread,
+						resourceId,
+						abortSignal: controller.signal,
+						...(workspace ? { workspace: workspace.lease } : {}),
+						emitHostEvent: hostEvents.emit,
+						executionId: admission.executionId,
+						message: payload.message,
+						attachments,
+						options: payload.options ?? {},
+					});
+				},
+			);
 		} finally {
 			signal.removeEventListener('abort', stopSetup);
 		}
@@ -432,6 +441,7 @@ export class SystemAgentExecutionService {
 			thread,
 			handle,
 			workspace,
+			hostEvents,
 			send,
 			controller,
 			admission,
@@ -485,9 +495,12 @@ export class SystemAgentExecutionService {
 		}
 		const checkpointHostMetadata = checkpoint.persistence.hostMetadata ?? {};
 		const controller = new AbortController();
+		const send = params.send ?? (() => {});
+		const hostEvents = this.createHostEventChannel(thread, send);
 		const workspace = await this.acquireWorkspace(provider, thread, params.user);
 		const handle = await this.prepareOrRelease(
 			workspace,
+			hostEvents,
 			controller.signal,
 			thread,
 			async () =>
@@ -498,6 +511,7 @@ export class SystemAgentExecutionService {
 					resourceId,
 					abortSignal: controller.signal,
 					...(workspace ? { workspace: workspace.lease } : {}),
+					emitHostEvent: hostEvents.emit,
 					runId,
 					toolCallId: pending.toolCallId,
 					checkpointHostMetadata,
@@ -519,7 +533,8 @@ export class SystemAgentExecutionService {
 			thread,
 			handle,
 			workspace,
-			send: params.send ?? (() => {}),
+			hostEvents,
+			send,
 			controller,
 			onExecutionStarted: params.onExecutionStarted,
 			prepare: async () => ({
@@ -701,6 +716,7 @@ export class SystemAgentExecutionService {
 	 */
 	private async prepareOrRelease(
 		workspace: TurnWorkspace | undefined,
+		hostEvents: SystemAgentHostEventChannel,
 		signal: AbortSignal,
 		thread: AgentExecutionThread,
 		prepare: () => Promise<SystemAgentTurnHandle>,
@@ -710,9 +726,26 @@ export class SystemAgentExecutionService {
 			this.attachFileStore(handle, thread);
 			return handle;
 		} catch (error) {
+			hostEvents.close();
 			await workspace?.release({ status: signal.aborted ? 'cancelled' : 'errored', error });
 			throw error;
 		}
+	}
+
+	/**
+	 * The host event channel of one turn. It sends to the same stream as the
+	 * turn, and the turn recorder records its events.
+	 */
+	private createHostEventChannel(
+		thread: AgentExecutionThread,
+		send: (event: AgentSseEvent) => void,
+	): SystemAgentHostEventChannel {
+		return new SystemAgentHostEventChannel(send, (name) => {
+			this.logger.debug('System agent host event after the turn settled was dropped', {
+				threadId: thread.id,
+				name,
+			});
+		});
 	}
 
 	/**
@@ -724,6 +757,7 @@ export class SystemAgentExecutionService {
 		thread,
 		handle,
 		workspace,
+		hostEvents,
 		send,
 		controller,
 		admission,
@@ -733,6 +767,7 @@ export class SystemAgentExecutionService {
 		thread: AgentExecutionThread;
 		handle: SystemAgentTurnHandle;
 		workspace?: TurnWorkspace;
+		hostEvents: SystemAgentHostEventChannel;
 		send: (event: AgentSseEvent) => void;
 		controller: AbortController;
 		/** Set when the queue admitted the turn. A resume admits its own turn. */
@@ -772,7 +807,13 @@ export class SystemAgentExecutionService {
 					executionId = id;
 					onExecutionStarted?.(id, threadId, inputMessageIds);
 				},
-				onBeforeFinalize: settle,
+				onRecorderCreated: (recorder) => hostEvents.attach(recorder),
+				// The settle hook runs before the record is final, so that the
+				// events it emits are stored with the turn.
+				onBeforeFinalize: async (outcome) => {
+					await settle(outcome);
+					hostEvents.close();
+				},
 				prepare,
 			});
 			for await (const chunk of stream) {
@@ -784,6 +825,8 @@ export class SystemAgentExecutionService {
 			throw caught;
 		} finally {
 			providerSignal?.removeEventListener('abort', stopTurn);
+			// The turn record is final here. A later event cannot be stored.
+			hostEvents.close();
 			// The runtime settles every turn that has an execution record. A turn
 			// that failed or stopped before it had one settles here.
 			if (!settled.outcome) {
