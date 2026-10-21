@@ -118,8 +118,11 @@ const showFixSuggestion = computed(
 		!suggestionDismissed.value,
 );
 // A "couldn't finish" case often has no output at all — it must still expand
-// to reach the correction form, so this isn't gated on output alone.
-const canExpand = computed(() => props.output !== null || needsCorrection.value);
+// to reach the correction form, so this isn't gated on output alone. An ungraded
+// check still needs the expanded row for its "Actually fine" and "Run check" buttons.
+const canExpand = computed(
+	() => props.output !== null || needsCorrection.value || props.notGraded === true,
+);
 
 type StatusText = { labelKey: BaseTextKey; color?: TextColor; warning?: boolean };
 

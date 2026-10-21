@@ -245,6 +245,17 @@ describe('AgentEvalTryRow', () => {
 				},
 			});
 
+		it('opens an ungraded check with no output, so its buttons are reachable', async () => {
+			const user = userEvent.setup();
+			const { getByTestId } = renderComponent({
+				props: { status: 'work', output: null, notGraded: true, testId: 'row' },
+			});
+			await user.click(getByTestId('row-toggle'));
+
+			expect(getByTestId('row-actually-fine')).toBeInTheDocument();
+			expect(getByTestId('row-run-check')).toBeInTheDocument();
+		});
+
 		it('says the check could not be graded, not that it needs work', () => {
 			const { getByText, queryByText } = renderNotGraded();
 
