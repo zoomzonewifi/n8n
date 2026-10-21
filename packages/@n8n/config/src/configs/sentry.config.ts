@@ -6,6 +6,16 @@ import { positiveIntSchema } from '../schemas';
 /** Schema for sample rates (0.0 to 1.0). */
 export const sampleRateSchema = z.number({ coerce: true }).min(0).max(1);
 
+export function isSentryTracingEnabled({
+	dsn,
+	tracesSampleRate,
+}: {
+	dsn: string;
+	tracesSampleRate: number;
+}): boolean {
+	return dsn !== '' && tracesSampleRate > 0;
+}
+
 @Config
 export class SentryConfig {
 	/** Sentry DSN (data source name) for the backend. */

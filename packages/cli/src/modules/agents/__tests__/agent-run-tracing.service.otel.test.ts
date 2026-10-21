@@ -9,6 +9,7 @@ import { OtelTestProvider } from '@/modules/otel/__tests__/support/otel-test-pro
 import { ExecutionLevelTracer } from '@/modules/otel/execution-level-tracer';
 import type { OtelSettingsService } from '@/modules/otel/otel-settings.service';
 import { OtelService } from '@/modules/otel/otel.service';
+import type { OtelSdk } from '@/observability/otel-sdk';
 
 import { AgentRunTracingService } from '../agent-run-tracing.service';
 
@@ -129,6 +130,7 @@ describe('AgentRunTracingService (real OTel provider)', () => {
 			mock<InstanceSettings>(),
 			mock<Logger>(),
 			mock<OutboundHttp>(),
+			mock<OtelSdk>(),
 		);
 		const service = new AgentRunTracingService(agentsConfig, otelService);
 

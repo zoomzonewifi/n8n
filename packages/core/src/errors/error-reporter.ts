@@ -1,5 +1,6 @@
 import { inTest, Logger } from '@n8n/backend-common';
 import { isAxiosError } from '@n8n/backend-network';
+import { isSentryTracingEnabled } from '@n8n/config';
 import { type InstanceType } from '@n8n/constants';
 import { Service } from '@n8n/di';
 import type { ReportingOptions } from '@n8n/errors';
@@ -257,7 +258,7 @@ export class ErrorReporter {
 			'ContextLines',
 		]);
 
-		const isTracingEnabled = tracesSampleRate > 0;
+		const isTracingEnabled = isSentryTracingEnabled({ dsn, tracesSampleRate });
 		if (isTracingEnabled) {
 			const tracingIntegrations: SentryIntegration[] = ['Http', 'Postgres', 'Redis', 'Express'];
 			tracingIntegrations

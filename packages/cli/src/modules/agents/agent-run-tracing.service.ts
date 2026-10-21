@@ -4,8 +4,7 @@ import { AgentsConfig } from '@n8n/config';
 import { Service } from '@n8n/di';
 
 import { OtelService } from '@/modules/otel/otel.service';
-
-const AGENTS_TRACER_NAME = '@n8n/agents';
+import { AGENTS_TRACER_NAME } from '@/observability/tracer-names';
 
 interface AgentRunTracingMetadataBase {
 	agentId: string;
